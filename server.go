@@ -2,6 +2,12 @@ package main
 
 import (
 	"log"
+	"context"
+	
+	"os/signal"
+	"os"
+	"syscall"
+	"sync"
 
 	"github.com/gofiber/fiber/v3"
 )
@@ -20,8 +26,6 @@ type Processor struct {
 }
 
 func main() {
-	app := fiber.New()
-
 	//тут нам по api key по идее нужно найти бакет
 	//а вообще скорее найти канал в который положить операцию,
 	//ведь запросы выполняются последовательно.
@@ -52,15 +56,49 @@ func main() {
 
 	var processor *Processor = startProcessor()
 
-	app.Get("/", func(c fiber.Ctx) error {
-		if processor.request(1).granted == 1 {
-			return c.SendString("c.SendStatus(fiber.StatusOK)")
-		} else {
-			return c.SendString("c.SendStatus(fiber.StatusTooManyRequests)")
-		}
+	//The remainder of this function could be just fiber.Listen(), but Fiber v2 does not listen context for graceful
+	// shutdown, neither does it return control after inialization. So, decided to move its startup into a goroutine
+	// completely and provide means for watching for subsequent failure of this or other subsystems.
+	//But, fiber V3 actually knows how to listen for graceful shutdown; meaning, if we accept 
+	// it as our only "blind-launch" but critical service, we could skip it all and just fiber.Listen()
+	// right here, since we won't be needing to wait for some other events in parallel.
+	//In the end, I decided to take the longer route because I want to be able to use other engines than Fiber,
+	// so I don't want it to transform my main routine into Fiber's event loop. Besides, this requires me to
+	// learn how to cope with related problems.
+
+	ctx, stop := signal.NotifyContext(
+		context.Background(),
+		os.Interrupt,
+		syscall.SIGTERM, //sadly no platform-neutral os.* constant for this; even though actually Go translates to SIGTERM on Windows
+	)
+	defer stop() //we won't need this context after this function completes
+
+	//In general case, with many subsystems like Fiber, we don't know how many errors we might face, 
+	// so we only process only (and we only need 1, because these are critical erros and we halt on them), 
+	// and we use sync.Once to make sure no one is trying to actually send more (and panic because no one listens anymore)
+	fatal := make(chan string, 1)
+	var once sync.Once
+
+	//Idiomatic approach says passing contexts along (here, or/and to fiber.Listen) because this clearly involves some 
+	// i/o and long activity. But actually it depends on how the called func will use the context: maybe I am passing 
+	// request-scoped context to some async processing, for example. In this case, passing globally-scoped notify-context 
+	// actually makes sense, but only if I want Fiber to use it for graceful shutdowns, and I stated above that I prefer it not to.
+	fiber := createHTTP(processor)
+	startHTTP(fiber, func(err string) {
+		//since it's closure and not explicit passing of "once", the language guarantees it's passed by reference,
+		// which is critical (we want to use same instance of this "once" everywhere)
+		once.Do(func() { fatal <- err } )
 	})
 
-	log.Fatal(app.Listen(":3000"))
+	select {
+	case err := <- fatal:
+		log.Fatal(err);
+	case <- ctx.Done(): 
+		if err := fiber.Shutdown(); err != nil {
+			log.Print(err)
+		}
+		processor.close()
+	}
 }
 
 func startProcessor() *Processor {
@@ -90,12 +128,38 @@ func startProcessor() *Processor {
 func (p *Processor) request(amount int) Response {
 	//buffered, because it makes no sense to block when responding, however little are chances;
 	// also, this avoids depending on the receiving side _still being alive_ (might have panicked or whatever)
+	//TODO potentially a performace hindrance, say 1M allocations/second, need to somehow measure and try another approach
 	reply := make(chan Response, 1)
 	p.rqChan <- Request { amount: amount, reply: reply }
 	return <- reply
 }
 
-//TODO support actually calling this :) To implement graceful shutdown
+//Relies on no concurrent/subsequent calls to request()
+//(if that is idiomatic expectation then we don't need that comment)
 func (p *Processor) close() { //close is the idiomatic name for stopping lifecycle and releasing resources
 	close(p.rqChan)
+}
+
+func createHTTP(processor *Processor) *fiber.App {
+	app := fiber.New()
+
+	app.Get("/", func(c fiber.Ctx) error {
+		if processor.request(1).granted == 1 {
+			return c.SendString("c.SendStatus(fiber.StatusOK)")
+		} else {
+			return c.SendString("c.SendStatus(fiber.StatusTooManyRequests)")
+		}
+	})
+
+	return app
+}
+
+func startHTTP(fiber *fiber.App, onError func(err string)) {
+	go func() {
+		//startup errors return non-nil, graceful shutdown returns nil, shutdown errors are only returned via shutdown()
+		if err := fiber.Listen(":3000"); err != nil { 
+			onError("HTTP Server failed")
+			log.Print(err)
+		}
+	}()
 }
