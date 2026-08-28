@@ -1,13 +1,14 @@
 package main
 
 import (
-	"log"
 	"context"
-	
-	"os/signal"
+	"log"
+	"time"
+
 	"os"
+	"os/signal"
 	"syscall"
-	
+
 	"github.com/gofiber/fiber/v3"
 	recoverer "github.com/gofiber/fiber/v3/middleware/recover"
 )
@@ -24,6 +25,9 @@ type Response struct {
 type Processor struct {
 	rqChan chan<- Request
 }
+
+const MAX_REQUEST int32 = 1000000
+const LIMIT int32 = 1 //1 RPS
 
 func main() {	
 	processorFailed := make(chan struct{}, 1)
@@ -74,6 +78,14 @@ func main() {
 	processor.close()
 }
 
+
+type Bucket struct {
+	count int32
+	limit int32
+	startedAt time.Time
+	issued int64
+}
+
 // In worker-pool approach, worker goroutines never complete, but they are reused and that saves some allocations etc.
 // In semaphore-protected approach, answering routines are completed and cleanly recreated, that's cleaner
 //  (no need to guarantee goroutine will not die out of panic) but more expensive.
@@ -94,21 +106,57 @@ func startProcessor(processorFailed chan<- struct{}) *Processor {
 			}
 		}()
 
-		limit := 2
+		//We could start with startedAt=0, but then one of two things happen
+		// - either first request interpretes that 0 as "empty bucket" - i.e. bucket starts refilling only then (so some time is lost)
+		// - or maybe as "full bucket" - bad if service is restarted from empty bucket and restart took less than 1 second (so, extra request may pass through)
+		bucket := Bucket { limit: LIMIT, startedAt: time.Now() }
 
 		//Note, range loop, just like 2-argument reading form, checks for closing the channel,
 		// we'll use it to propagate graceful shutdown to our goroutine
 		for request := range reqChan {
-			if limit < request.amount {
+			refill(&bucket, time.Now())
+
+			if (request.amount > int(MAX_REQUEST)) { //int32 fits in int
+				request.amount = int(MAX_REQUEST)
+			}
+			amount := int32(request.amount)
+			
+			if bucket.count < amount {
 				request.reply <- Response { granted: 0 }
 			} else {
-				limit -= request.amount
+				bucket.count -= amount
 				request.reply <- Response { granted: request.amount }
 			}
 		}
 	}()
 
 	return &Processor { rqChan: reqChan }
+}
+
+//TODO: how critical can possible time leap be? Like, in "leap second" or "switch to daylight time"
+func refill (bucket *Bucket, now time.Time) {
+	//Have to re-establish some type boundaries to avoid precision loss (= increment in stairs) 
+	// by accidentally casting float64(int64) when I wanted to cast float64(int32); or to avoid
+	// messing up integer conversion.
+	var limit int32 = bucket.limit
+
+	//Actually we don't need utmost precision here, if we pour less buckets this microsecond, we'll just pour more the next one;
+	// we only want it to be more or less smooth, so millis would not work good. At the same time, why lose precision by using micros
+	// when we can just as well use nanos? Even 100 years as Nanos still fits int64
+	elapsed := now.Sub(bucket.startedAt).Nanoseconds()
+	expectation := float64(elapsed) / float64(time.Second.Nanoseconds()) * float64(limit)
+	delta := int64(expectation) - bucket.issued
+	bucket.issued += delta
+
+	//Now put them to bucket. But, we don't necessarily put all of them - to avoid bursts after delays
+	//This also helps us avoid >int32 deltas
+	if delta > int64(limit) {
+		delta = int64(limit)
+	}
+	bucket.count += int32(delta)
+	if (bucket.count > limit) {
+		bucket.count = limit
+	}
 }
 
 //Although idiomatic (responding via channel), implementation is still better be hidden
@@ -145,9 +193,9 @@ func createHTTP(processor *Processor, fiberFailed chan<- struct{}) *fiber.App {
 	// and sharding management is somewhat trickier but makes the project bloat without showing any extra Go mastery.
 	app.Get("/", func(c fiber.Ctx) error {
 		if processor.request(1).granted == 1 {
-			return c.SendString("c.SendStatus(fiber.StatusOK)")
+			return c.SendStatus(fiber.StatusOK)
 		} else {
-			return c.SendString("c.SendStatus(fiber.StatusTooManyRequests)")
+			return c.SendStatus(fiber.StatusTooManyRequests)
 		}
 	})
 
@@ -172,6 +220,13 @@ func startHTTP(fiber *fiber.App, fiberFailed chan<- struct{}) {
 	}()
 }
 
-//TODO: fill bucket; how?
 //TODO: real bucket algo
-//TODO: mutex + fast path
+//TODO: mutex + fast path (or maybe CAS)
+//TODO: config for acceptance limit Q (max sum quota) and acceptance multiplier K; load shedding over capacity = L * K
+//      (google's default is K=2.0, provided that rejection path is much shorter than acceptance path, but I'll need to measure
+//       whether that's my case or not, and maybe set it to some LOWER value - after all, by serving over Q, we only want
+//.      to propagate feedback to clients, we don't necessarily need to serve those extra requests out of pure principle;
+//.      thus, if that's too costly, we are going to just ignore them).*
+//.      * Setting the capacity closer to Q, however, means load-shedding is more likely to happen, and it can hurt well-behaving
+//.        clients; that's bad, but if it's good enough compromise for Google, I'll take it. 
+//         Thus, picking good value for K must be tuned for each specific system, minding how compliant the clients are expected to be. 
