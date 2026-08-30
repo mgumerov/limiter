@@ -2,8 +2,9 @@ package main
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"time"
+	"fmt"
 
 	"os"
 	"os/signal"
@@ -11,9 +12,12 @@ import (
 
 	"github.com/gofiber/fiber/v3"
 	recoverer "github.com/gofiber/fiber/v3/middleware/recover"
+
+	"gopkg.in/yaml.v3"
 )
 
 type Request struct {
+	key string
 	amount int
 	reply chan<- Response
 }
@@ -26,12 +30,35 @@ type Processor struct {
 	rqChan chan<- Request
 }
 
-const MAX_REQUEST int32 = 1000000
-const LIMIT int32 = 1 //1 RPS
 
-func main() {	
+type Config struct {
+	Port     	int           				`yaml:"port"`
+	MaxRequest  int32         				`yaml:"max_requests"`
+	APIs 		map[string] int32			`yaml:"api"`
+}
+
+func main() {
+	if level := os.Getenv("LOG_LEVEL"); level != "" {
+		var logLevel slog.Level
+		if err := logLevel.UnmarshalText([]byte(level)); err != nil {
+			slog.Warn("Invalid log config specified, ignoring")
+		} else {
+			slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{ Level: logLevel })))
+		}
+	}
+
+	configPath := os.Getenv("CONFIG_PATH")
+	if configPath == "" {
+		configPath = "config.yaml"
+	}
+	cfg, err := LoadConfig(configPath)
+	if err != nil {
+		slog.Error("failed to load configuration", "path", configPath, "error", err)
+		os.Exit(1) //TODO
+	}
+
 	processorFailed := make(chan struct{}, 1)
-	var processor *Processor = startProcessor(processorFailed);
+	var processor *Processor = startProcessor(processorFailed, cfg);
 
 	//The remainder of this function could be just fiber.Listen(), but Fiber v2 does not listen context for graceful
 	// shutdown, neither does it return control after inialization. So, decided to move its startup into a goroutine
@@ -56,23 +83,22 @@ func main() {
 	// actually makes sense, but only if I want Fiber to use it for graceful shutdowns, and I stated above that I prefer it not to.
 	fiberFailed := make(chan struct{}, 1)
 	fiber := createHTTP(processor, fiberFailed)
-	startHTTP(fiber, fiberFailed);
+	startHTTP(fiber, fiberFailed, cfg);
 	
 	select {
 	case <- ctx.Done():
 		//do nothing
 	case <- fiberFailed:
-		log.Print("HTTP server terminated unexpectedly") //since we did not tell it to shut down yet
+		slog.Error("HTTP server terminated unexpectedly") //since we did not tell it to shut down yet
 		fiber = nil
 	case <- processorFailed:
-		log.Print("Processing Worker terminated unexpectedly") //since we did not tell it to shut down yet
+		slog.Error("Processing Worker terminated unexpectedly") //since we did not tell it to shut down yet
 		fiber = nil
-	
 	}
 	
 	if fiber != nil {
 		if err := fiber.Shutdown(); err != nil {
-			log.Print(err)
+			slog.Error("Error while shutting down HTTP server", "error", err)
 		}
 	}
 	processor.close()
@@ -93,7 +119,7 @@ type Bucket struct {
 //  It does not use allocations and does not need goroutine creation at all, and appears like most efficient solution.
 // What do I pick? I'll allow selecting between worker-pool and mutex, because I have some reservation about mutex drawbacks 
 //  and need to do measurements.
-func startProcessor(processorFailed chan<- struct{}) *Processor {
+func startProcessor(processorFailed chan<- struct{}, cfg *Config) *Processor {
 	reqChan := make(chan Request) //unbuffered, because what good such buffering is - under heavy load?
 	
 	//Process all requests sequentially by a single goroutine
@@ -101,23 +127,35 @@ func startProcessor(processorFailed chan<- struct{}) *Processor {
 		defer func() {
 			//We still want to attempt a controlled termination in main routine, not just crash the app right here
 			if r := recover(); r != nil {
-				log.Printf("Processing Worker panicked: %v", r)
+				slog.Error("Processing Worker panicked", "error", r)
 				processorFailed <- struct{}{}
 			}
 		}()
-
-		//We could start with startedAt=0, but then one of two things happen
-		// - either first request interpretes that 0 as "empty bucket" - i.e. bucket starts refilling only then (so some time is lost)
-		// - or maybe as "full bucket" - bad if service is restarted from empty bucket and restart took less than 1 second (so, extra request may pass through)
-		bucket := Bucket { limit: LIMIT, startedAt: time.Now() }
+		
+		buckets := make(map[string]*Bucket)
+		startedAt := time.Now()
+		for key, limit := range cfg.APIs {
+			//We could start with startedAt=0, but then one of two things happen
+			// - either first request interpretes that 0 as "empty bucket" - i.e. bucket starts refilling only then (so some time is lost)
+			// - or maybe as "full bucket" - bad if service is restarted from empty bucket and restart took less than 1 second (so, extra request may pass through)
+			buckets[key] = &Bucket { limit: limit, startedAt: startedAt }
+		}
 
 		//Note, range loop, just like 2-argument reading form, checks for closing the channel,
 		// we'll use it to propagate graceful shutdown to our goroutine
 		for request := range reqChan {
-			refill(&bucket, time.Now())
+			slog.Debug("Processing request", "key", request.key, "amount", request.amount)
 
-			if (request.amount > int(MAX_REQUEST)) { //int32 fits in int
-				request.amount = int(MAX_REQUEST)
+			bucket, ok := buckets[request.key]
+			if (!ok) {
+				request.reply <- Response { granted: 0 } //for real use, we should maybe distinguish this error reason
+				continue
+			}
+
+			refill(bucket, time.Now())
+
+			if (request.amount > int(cfg.MaxRequest)) { //int32 fits in int
+				request.amount = int(cfg.MaxRequest)
 			}
 			amount := int32(request.amount)
 			
@@ -160,12 +198,12 @@ func refill (bucket *Bucket, now time.Time) {
 }
 
 //Although idiomatic (responding via channel), implementation is still better be hidden
-func (p *Processor) request(amount int) Response {
+func (p *Processor) request(key string, amount int) Response {
 	//buffered, because it makes no sense to block when responding, however little are chances;
 	// also, this avoids depending on the receiving side _still being alive_ (might have panicked or whatever)
 	//TODO potentially a performace hindrance, say 1M allocations/second, need to somehow measure and try another approach
 	reply := make(chan Response, 1)
-	p.rqChan <- Request { amount: amount, reply: reply }
+	p.rqChan <- Request { key: key, amount: amount, reply: reply }
 	return <- reply
 }
 
@@ -187,40 +225,71 @@ func createHTTP(processor *Processor, fiberFailed chan<- struct{}) *fiber.App {
 				return fiber.ErrInternalServerError
 			}}));
 
-	//Actually we should be looking up a bucket which a specific API call uses (say, calls to one service uses one bucket, calls to other service use another);
-	// and futher development of that idea would be sharding instances by API key.
-	//But let's leave all that out of scope for the sake of being concise: multiple buckets is simple to implement and does not require any learning,
-	// and sharding management is somewhat trickier but makes the project bloat without showing any extra Go mastery.
-	app.Get("/", func(c fiber.Ctx) error {
-		if processor.request(1).granted == 1 {
+	//Actually, different buckets could be served by different dedicated workers, especially since there are no causality requirements
+	// between requesting from them. Instead, we'll keep serving them all from same thread, to avoid overcomplicating this
+	// PoC work, because otherwise we need to consider it carefully (also we could serve different APIs from different shards).
+	handler := func (key string, amount int32, c fiber.Ctx) error {
+		slog.Debug("Serving request", "key", key, "amount", amount)
+		if processor.request(key, 1).granted == 1 {
 			return c.SendStatus(fiber.StatusOK)
 		} else {
 			return c.SendStatus(fiber.StatusTooManyRequests)
 		}
+	}
+	
+	//Use POST, not GET, because of read-only and idempotency requirements of HTTP, and because request body allows to send more data and in a safer way.
+	//TODO better move parameter to POST body
+	app.Post("/:key", func(c fiber.Ctx) error {
+		return handler(c.Params("key"), 1, c)
+	})
+	//However, for debugging purposes GET is sometimes more convenient, while under heavy development
+	app.Get("/:key", func(c fiber.Ctx) error {
+		return handler(c.Params("key"), 1, c)
 	})
 
 	return app
 }
 
-func startHTTP(fiber *fiber.App, fiberFailed chan<- struct{}) {
+func startHTTP(fiber *fiber.App, fiberFailed chan<- struct{}, cfg *Config) {
 	go func() {
 		defer func() { //always report termination
 			//We still want to attempt a controlled termination in main routine, not just crash the app right here
 			if r := recover(); r != nil {
-        	    log.Printf("HTTP server panicked: %v", r)
+        	    slog.Error("HTTP server panicked", "error", r)
 				fiberFailed <- struct{}{}
         	}
 		} ()
 			
 		//startup errors return non-nil, graceful shutdown returns nil, shutdown errors are only returned via shutdown() - not here
-		if err := fiber.Listen(":3000"); err != nil {
-			log.Printf("HTTP server startup failed: %v", err)
+		if err := fiber.Listen(fmt.Sprintf(":%d", cfg.Port)); err != nil {
+			slog.Error("HTTP server startup failed", "error", err)
 			fiberFailed <- struct{}{}
 		}
 	}()
 }
 
-//TODO: real bucket algo
+func LoadConfig(path string) (*Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("reading config file: %w", err)
+	}
+
+	var cfg Config
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("parsing YAML: %w", err)
+	}
+
+	//This is better be decoupled from reading because we could load config from different sources. For now, we don't.
+	if cfg.MaxRequest == 0 {
+		return nil, fmt.Errorf("Maximum request size is not defined")
+	}
+	if cfg.Port == 0 {
+		return nil, fmt.Errorf("Port is not defined")
+	}
+
+	return &cfg, nil
+}
+
 //TODO: mutex + fast path (or maybe CAS)
 //TODO: config for acceptance limit Q (max sum quota) and acceptance multiplier K; load shedding over capacity = L * K
 //      (google's default is K=2.0, provided that rejection path is much shorter than acceptance path, but I'll need to measure
