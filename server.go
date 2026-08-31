@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"time"
 	"fmt"
+	"strconv"
 
 	"os"
 	"os/signal"
@@ -18,12 +19,12 @@ import (
 
 type Request struct {
 	key string
-	amount int
+	amount int32
 	reply chan<- Response
 }
 
 type Response struct {
-	granted int
+	granted int32
 }
 
 type Processor struct {
@@ -138,6 +139,7 @@ func startProcessor(processorFailed chan<- struct{}, cfg *Config) *Processor {
 			//We could start with startedAt=0, but then one of two things happen
 			// - either first request interpretes that 0 as "empty bucket" - i.e. bucket starts refilling only then (so some time is lost)
 			// - or maybe as "full bucket" - bad if service is restarted from empty bucket and restart took less than 1 second (so, extra request may pass through)
+			//Also we start with empty buckets because of that same problem with "full bucket" approach
 			buckets[key] = &Bucket { limit: limit, startedAt: startedAt }
 		}
 
@@ -154,17 +156,12 @@ func startProcessor(processorFailed chan<- struct{}, cfg *Config) *Processor {
 
 			refill(bucket, time.Now())
 
-			if (request.amount > int(cfg.MaxRequest)) { //int32 fits in int
-				request.amount = int(cfg.MaxRequest)
+			if (request.amount > cfg.MaxRequest) {
+				request.amount = cfg.MaxRequest
 			}
-			amount := int32(request.amount)
-			
-			if bucket.count < amount {
-				request.reply <- Response { granted: 0 }
-			} else {
-				bucket.count -= amount
-				request.reply <- Response { granted: request.amount }
-			}
+			granted := min(request.amount, bucket.count)
+			bucket.count -= granted
+			request.reply <- Response { granted: granted }
 		}
 	}()
 
@@ -198,7 +195,7 @@ func refill (bucket *Bucket, now time.Time) {
 }
 
 //Although idiomatic (responding via channel), implementation is still better be hidden
-func (p *Processor) request(key string, amount int) Response {
+func (p *Processor) request(key string, amount int32) Response {
 	//buffered, because it makes no sense to block when responding, however little are chances;
 	// also, this avoids depending on the receiving side _still being alive_ (might have panicked or whatever)
 	//TODO potentially a performace hindrance, say 1M allocations/second, need to somehow measure and try another approach
@@ -230,9 +227,12 @@ func createHTTP(processor *Processor, fiberFailed chan<- struct{}) *fiber.App {
 	// PoC work, because otherwise we need to consider it carefully (also we could serve different APIs from different shards).
 	handler := func (key string, amount int32, c fiber.Ctx) error {
 		slog.Debug("Serving request", "key", key, "amount", amount)
-		if processor.request(key, 1).granted == 1 {
+		result := processor.request(key, amount)
+		if result.granted == amount {
 			return c.SendStatus(fiber.StatusOK)
 		} else {
+			//TODO headers like x-ratelimit-*
+			c.Set("X-RateLimit-Granted", strconv.Itoa(int(result.granted)))
 			return c.SendStatus(fiber.StatusTooManyRequests)
 		}
 	}
@@ -240,11 +240,19 @@ func createHTTP(processor *Processor, fiberFailed chan<- struct{}) *fiber.App {
 	//Use POST, not GET, because of read-only and idempotency requirements of HTTP, and because request body allows to send more data and in a safer way.
 	//TODO better move parameter to POST body
 	app.Post("/:key", func(c fiber.Ctx) error {
-		return handler(c.Params("key"), 1, c)
+		q, err := strconv.ParseInt(c.Query("q", "1"), 10, 32)
+		if err != nil {
+			return fmt.Errorf("Amount parse error: %w", err)
+		}
+		return handler(c.Params("key"), int32(q), c)
 	})
 	//However, for debugging purposes GET is sometimes more convenient, while under heavy development
 	app.Get("/:key", func(c fiber.Ctx) error {
-		return handler(c.Params("key"), 1, c)
+		q, err := strconv.ParseInt(c.Query("q", "1"), 10, 32)
+		if err != nil {
+			return fmt.Errorf("Amount parse error: %w", err)
+		}
+		return handler(c.Params("key"), int32(q), c)
 	})
 
 	return app
