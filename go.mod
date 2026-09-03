@@ -2,6 +2,8 @@ module limiter
 
 go 1.27.0
 
+require github.com/VictoriaMetrics/metrics v1.44.0
+
 require (
 	github.com/andybalholm/brotli v1.2.2 // indirect
 	github.com/gofiber/fiber/v2 v2.52.15 // indirect
@@ -18,6 +20,8 @@ require (
 	github.com/tinylib/msgp v1.6.4 // indirect
 	github.com/valyala/bytebufferpool v1.0.0 // indirect
 	github.com/valyala/fasthttp v1.73.0 // indirect
+	github.com/valyala/fastrand v1.1.0 // indirect
+	github.com/valyala/histogram v1.2.0 // indirect
 	github.com/valyala/tcplisten v1.0.0 // indirect
 	golang.org/x/crypto v0.54.0 // indirect
 	golang.org/x/net v0.57.0 // indirect
