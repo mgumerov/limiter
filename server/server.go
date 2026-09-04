@@ -1,43 +1,29 @@
-package main
+package server
 
 import (
-	"context"
-	"log/slog"
-	"time"
 	"fmt"
-	"bytes"
+	"log/slog"
 	"strconv"
-	"sync/atomic"
 
-	"os"
-	"os/signal"
-	"syscall"
+	"time"
 
 	"github.com/gofiber/fiber/v3"
 	recoverer "github.com/gofiber/fiber/v3/middleware/recover"
 
-	"gopkg.in/yaml.v3"
-
 	"github.com/VictoriaMetrics/metrics"
-
 )
 
-type Request struct {
-	key string
-	amount int32
-	reply chan<- Response
-}
-
 type Response struct {
-	granted int32
+	Granted int32
 }
 
-type Processor struct {
-	rqChan chan<- Request
-}
+type Processor interface {
+	Request(key string, amount int32) Response
 
-var myMetrics = metrics.NewSet()
-var handlerTime = myMetrics.NewHistogram("handler_time")
+	//Relies on no concurrent/subsequent calls to request()
+	//(if that is idiomatic expectation then we don't need that comment)
+	Close() //close is the idiomatic name for stopping lifecycle and releasing resources
+}
 
 type Config struct {
 	Port     	int           				`yaml:"port"`
@@ -45,200 +31,43 @@ type Config struct {
 	APIs 		map[string] int32			`yaml:"api"`
 }
 
-func main() {
-	if level := os.Getenv("LOG_LEVEL"); level != "" {
-		var logLevel slog.Level
-		if err := logLevel.UnmarshalText([]byte(level)); err != nil {
-			slog.Warn("Invalid log config specified, ignoring")
-		} else {
-			slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{ Level: logLevel })))
-		}
-	}
-
-	configPath := os.Getenv("CONFIG_PATH")
-	if configPath == "" {
-		configPath = "config.yaml"
-	}
-	cfg, err := LoadConfig(configPath)
-	if err != nil {
-		slog.Error("failed to load configuration", "path", configPath, "error", err)
-		os.Exit(1) //TODO
-	}
-
-	processorFailed := make(chan struct{}, 1)
-	var processor *Processor = startProcessor(processorFailed, cfg);
-
-	//The remainder of this function could be just fiber.Listen(), but Fiber v2 does not listen context for graceful
-	// shutdown, neither does it return control after inialization. So, decided to move its startup into a goroutine
-	// completely and provide means for watching for subsequent failure of this or other subsystems.
-	//But, fiber V3 actually knows how to listen for graceful shutdown; meaning, if we accept 
-	// it as our only "blind-launch" but critical service, we could skip it all and just fiber.Listen()
-	// right here, since we won't be needing to wait for some other events in parallel.
-	//In the end, I decided to take the longer route because I want to be able to use other engines than Fiber,
-	// so I don't want it to transform my main routine into Fiber's event loop. Besides, this requires me to
-	// learn how to cope with related problems.
-
-	ctx, stop := signal.NotifyContext(
-		context.Background(),
-		os.Interrupt,
-		syscall.SIGTERM, //sadly no platform-neutral os.* constant for this; even though actually Go translates to SIGTERM on Windows
-	)
-	defer stop() //we won't need this context after this function completes
-
-	//Idiomatic approach says passing contexts along (here, or/and to fiber.Listen) because this clearly involves some 
-	// i/o and long activity. But actually it depends on how the called func will use the context: maybe I am passing 
-	// request-scoped context to some async processing, for example. In this case, passing globally-scoped notify-context 
-	// actually makes sense, but only if I want Fiber to use it for graceful shutdowns, and I stated above that I prefer it not to.
-	fiberFailed := make(chan struct{}, 1)
-	fiber := createHTTP(processor, fiberFailed)
-	startHTTP(fiber, fiberFailed, cfg);
-	
-	select {
-	case <- ctx.Done():
-		//do nothing
-	case <- fiberFailed:
-		slog.Error("HTTP server terminated unexpectedly") //since we did not tell it to shut down yet
-		fiber = nil
-	case <- processorFailed:
-		slog.Error("Processing Worker terminated unexpectedly") //since we did not tell it to shut down yet
-		fiber = nil
-	}
-	
-	slog.Info("Stopping", "totalP", totalP.Load() / 1000000)
-	var buf bytes.Buffer
-	myMetrics.WritePrometheus(&buf)
-	slog.Info("Handler time", "metrics", buf.String())
-	
-	if fiber != nil {
-		if err := fiber.Shutdown(); err != nil {
-			slog.Error("Error while shutting down HTTP server", "error", err)
-		}
-	}
-	processor.close()
-}
-
-
 type Bucket struct {
-	count int32
-	limit int32
-	startedAt time.Time
-	issued int64
-}
-
-var totalP atomic.Int64
-
-// In worker-pool approach, worker goroutines never complete, but they are reused and that saves some allocations etc.
-// In semaphore-protected approach, answering routines are completed and cleanly recreated, that's cleaner
-//  (no need to guarantee goroutine will not die out of panic) but more expensive.
-// Also, since I don't want more than 1 request processed at each moment, I can use mutex-protected approach. 
-//  It does not use allocations and does not need goroutine creation at all, and appears like most efficient solution.
-// What do I pick? I'll allow selecting between worker-pool and mutex, because I have some reservation about mutex drawbacks 
-//  and need to do measurements.
-func startProcessor(processorFailed chan<- struct{}, cfg *Config) *Processor {
-	reqChan := make(chan Request) //unbuffered, because what good such buffering is - under heavy load?
-	
-	//Process all requests sequentially by a single goroutine
-	go func() {
-		defer func() {
-			//We still want to attempt a controlled termination in main routine, not just crash the app right here
-			if r := recover(); r != nil {
-				slog.Error("Processing Worker panicked", "error", r)
-				processorFailed <- struct{}{}
-			}
-		}()
-		
-		buckets := make(map[string]*Bucket)
-		startedAt := time.Now()
-		for key, limit := range cfg.APIs {
-			//We could start with startedAt=0, but then one of two things happen
-			// - either first request interpretes that 0 as "empty bucket" - i.e. bucket starts refilling only then (so some time is lost)
-			// - or maybe as "full bucket" - bad if service is restarted from empty bucket and restart took less than 1 second (so, extra request may pass through)
-			//Also we start with empty buckets because of that same problem with "full bucket" approach
-			buckets[key] = &Bucket { limit: limit, startedAt: startedAt }
-		}
-
-		//Note, range loop, just like 2-argument reading form, checks for closing the channel,
-		// we'll use it to propagate graceful shutdown to our goroutine
-		for request := range reqChan {
-			start := time.Now()
-			slog.Debug("Processing request", "key", request.key, "amount", request.amount)
-
-			//Compared to my initial implementation, keeping buckets in heap (presumably) and retrieving potentially
-			// new bucket each time - hurts locality. It might make sense to associate dedicated worker with each
-			// bucket and make that bucket a local variable, that way maybe compiler will even use registers and not
-			// real RAM. On the other hand, it's not like we use DIFFERENT workers to process same bucket, it's 
-			// the other way around, so it should not hurt that much.
-			// I did some *load tests* and they don't show significant differences. Actually, they weren't stable enough
-			// to prove there is no difference, but in both cases pure processing time (not counting receiving from channel)
-			// for 500k requests with pauses makes up for 140-150ms. So, further measurements would be necessary, but 
-			// there is no immediately noticeable difference. More importantly, since I am aiming at 500k RPS
-			// and currently only seem to serve 100K, clearly 140ms or say 120 or 160ms do not really mean any difference,
-			// it's not the slowest thing on request path :(
-			bucket, ok := buckets[request.key]
-			if (!ok) {
-				request.reply <- Response { granted: 0 } //for real use, we should maybe distinguish this error reason
-				continue
-			}
-
-			refill(bucket, time.Now())
-
-			if (request.amount > cfg.MaxRequest) {
-				request.amount = cfg.MaxRequest
-			}
-			granted := min(request.amount, bucket.count)
-			bucket.count -= granted
-			request.reply <- Response { granted: granted }
-
-			totalP.Add(time.Since(start).Nanoseconds())
-		}
-	}()
-
-	return &Processor { rqChan: reqChan }
+	Count int32
+	Limit int32
+	StartedAt time.Time
+	Issued int64
 }
 
 //TODO: how critical can possible time leap be? Like, in "leap second" or "switch to daylight time"
-func refill (bucket *Bucket, now time.Time) {
+func Refill (bucket *Bucket, now time.Time) {
 	//Have to re-establish some type boundaries to avoid precision loss (= increment in stairs) 
 	// by accidentally casting float64(int64) when I wanted to cast float64(int32); or to avoid
 	// messing up integer conversion.
-	var limit int32 = bucket.limit
+	var limit int32 = bucket.Limit
 
 	//Actually we don't need utmost precision here, if we pour less buckets this microsecond, we'll just pour more the next one;
 	// we only want it to be more or less smooth, so millis would not work good. At the same time, why lose precision by using micros
 	// when we can just as well use nanos? Even 100 years as Nanos still fits int64
-	elapsed := now.Sub(bucket.startedAt).Nanoseconds()
+	elapsed := now.Sub(bucket.StartedAt).Nanoseconds()
 	expectation := float64(elapsed) / float64(time.Second.Nanoseconds()) * float64(limit)
-	delta := int64(expectation) - bucket.issued
-	bucket.issued += delta
+	delta := int64(expectation) - bucket.Issued
+	bucket.Issued += delta
 
 	//Now put them to bucket. But, we don't necessarily put all of them - to avoid bursts after delays
 	//This also helps us avoid >int32 deltas
 	if delta > int64(limit) {
 		delta = int64(limit)
 	}
-	bucket.count += int32(delta)
-	if (bucket.count > limit) {
-		bucket.count = limit
+	bucket.Count += int32(delta)
+	if (bucket.Count > limit) {
+		bucket.Count = limit
 	}
 }
 
-//Although idiomatic (responding via channel), implementation is still better be hidden
-func (p *Processor) request(key string, amount int32) Response {
-	//buffered, because it makes no sense to block when responding, however little are chances;
-	// also, this avoids depending on the receiving side _still being alive_ (might have panicked or whatever)
-	//TODO potentially a performace hindrance, say 1M allocations/second, need to somehow measure and try another approach
-	reply := make(chan Response, 1)
-	p.rqChan <- Request { key: key, amount: amount, reply: reply }
-	return <- reply
-}
+//TODO better move to main or somewhere else
+func CreateHTTP(processor Processor, fiberFailed chan<- struct{}, myMetrics *metrics.Set) *fiber.App {
+	handlerTime := myMetrics.NewHistogram("handler_time")
 
-//Relies on no concurrent/subsequent calls to request()
-//(if that is idiomatic expectation then we don't need that comment)
-func (p *Processor) close() { //close is the idiomatic name for stopping lifecycle and releasing resources
-	close(p.rqChan)
-}
-
-func createHTTP(processor *Processor, fiberFailed chan<- struct{}) *fiber.App {
 	app := fiber.New()
 
 	app.Use(recoverer.New(recoverer.Config {
@@ -256,14 +85,14 @@ func createHTTP(processor *Processor, fiberFailed chan<- struct{}) *fiber.App {
 	handler := func (key string, amount int32, c fiber.Ctx) error {
 		start := time.Now()
 		slog.Debug("Serving request", "key", key, "amount", amount)
-		result := processor.request(key, amount)
+		result := processor.Request(key, amount)
 		handlerTime.UpdateDuration(start)
 	
-		if result.granted == amount {
+		if result.Granted == amount {
 			return c.SendStatus(fiber.StatusOK)
 		} else {
 			//TODO headers like x-ratelimit-*
-			c.Set("X-RateLimit-Granted", strconv.Itoa(int(result.granted)))
+			c.Set("X-RateLimit-Granted", strconv.Itoa(int(result.Granted)))
 			return c.SendStatus(fiber.StatusTooManyRequests)
 		}
 	}
@@ -289,7 +118,8 @@ func createHTTP(processor *Processor, fiberFailed chan<- struct{}) *fiber.App {
 	return app
 }
 
-func startHTTP(http *fiber.App, fiberFailed chan<- struct{}, cfg *Config) {
+//TODO better move to main or somewhere else
+func StartHTTP(http *fiber.App, fiberFailed chan<- struct{}, cfg *Config) {
 	go func() {
 		defer func() { //always report termination
 			//We still want to attempt a controlled termination in main routine, not just crash the app right here
@@ -305,28 +135,6 @@ func startHTTP(http *fiber.App, fiberFailed chan<- struct{}, cfg *Config) {
 			fiberFailed <- struct{}{}
 		}
 	}()
-}
-
-func LoadConfig(path string) (*Config, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("reading config file: %w", err)
-	}
-
-	var cfg Config
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("parsing YAML: %w", err)
-	}
-
-	//This is better be decoupled from reading because we could load config from different sources. For now, we don't.
-	if cfg.MaxRequest == 0 {
-		return nil, fmt.Errorf("Maximum request size is not defined")
-	}
-	if cfg.Port == 0 {
-		return nil, fmt.Errorf("Port is not defined")
-	}
-
-	return &cfg, nil
 }
 
 //TODO: mutex + fast path (or maybe CAS)
@@ -422,7 +230,10 @@ type ComplexRequest struct {
 // А если
 // 6x128x300 => 33k (6 - это GOMAXPROCS конкретного теста), а два таких параллельно в одном инстансе -> 66k (нет деградации на сервере)
 // GOMAXPROCS=6 hey -n 50000 -c 128 -q 350 => 44Kx2, нет деградации
-// GOMAXPROCS=6 hey -n 50000 -c 128 -q 370 => 43+46, вместо 2x47, пошла деградация
+// GOMAXPROCS=6 hey -n 50000 -c 128 -q 370 => 43+46, вместо 2x47, пошла деградация - но мы знаем что она не из-за ограничений сервера
+// и скорее всего не из-за клиента (выше показано что и тот и другой были способы обрабатывать больше - при -c 512 -q 300; хотя конечно
+// само нарастание конкуренции на клиенте могло начать приводить к перегибу - будем и такую возможность держать в уме, может быть потом
+// перепроверим на более мощном клиенте).
 
 // Вот тут и есть наш излом. И что делать с этим? Ну, надо например посмотреть нельзя ли так переписать код
 // или изменить подход, что деградация при этом показателе пропадет.
