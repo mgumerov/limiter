@@ -1,17 +1,21 @@
 package main
 
 import (
-	"fmt"
 	"bytes"
+	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
-	"context"
-	"gopkg.in/yaml.v3"
-	"github.com/VictoriaMetrics/metrics"
 
+	"github.com/VictoriaMetrics/metrics"
+	"gopkg.in/yaml.v3"
+
+	"limiter/fiberserver"
+	"limiter/mutexproc"
 	"limiter/server"
+	"limiter/testserver"
 	"limiter/workerproc"
 )
 
@@ -42,8 +46,17 @@ func main() {
 	var myMetrics = metrics.NewSet()
 
 	processorFailed := make(chan struct{}, 1)
-	var processor server.Processor = workerproc.StartWorkerProcessor(processorFailed, cfg, myMetrics);
-
+	var processor server.Processor
+	switch v := os.Getenv("P"); v {
+	case "W": processor = workerproc.StartWorkerProcessor(processorFailed, cfg, myMetrics)
+	case "M": processor = mutexproc.StartMutexProcessor(processorFailed, cfg, myMetrics)
+	case "N": processor = &NoOpProcessor{}
+	default:
+		slog.Error("Invalid request processor specified in env", "P", v)
+		processor = &NoOpProcessor{} //still create a stub to be safely passed as dependency
+		processorFailed <- struct{}{}
+	}
+	
 	//The remainder of this function could be just fiber.Listen(), but Fiber v2 does not listen context for graceful
 	// shutdown, neither does it return control after inialization. So, decided to move its startup into a goroutine
 	// completely and provide means for watching for subsequent failure of this or other subsystems.
@@ -65,28 +78,35 @@ func main() {
 	// i/o and long activity. But actually it depends on how the called func will use the context: maybe I am passing 
 	// request-scoped context to some async processing, for example. In this case, passing globally-scoped notify-context 
 	// actually makes sense, but only if I want Fiber to use it for graceful shutdowns, and I stated above that I prefer it not to.
-	fiberFailed := make(chan struct{}, 1)
-	fiber := server.CreateHTTP(processor, fiberFailed, myMetrics)
-	server.StartHTTP(fiber, fiberFailed, cfg);
+	serverFailed := make(chan struct{}, 1)
+	var server server.Server
+	switch v := os.Getenv("S"); v {
+	case "F": server = fiberserver.CreateFiberServer(processor, serverFailed, cfg, myMetrics)
+	case "T": server = testserver.CreateTestServer(processor, serverFailed, cfg, myMetrics)
+	default:
+		slog.Error("Invalid request server specified in env", "S", v)
+		server = &NoOpServer{} //still create a stub to be safely passed as dependency
+		serverFailed <- struct{}{}
+	}
 
 	select {
 	case <- ctx.Done():
 		//do nothing
-	case <- fiberFailed:
+	case <- serverFailed:
 		slog.Error("HTTP server terminated unexpectedly") //since we did not tell it to shut down yet
-		fiber = nil
+		server = nil
 	case <- processorFailed:
-		slog.Error("Processing Worker terminated unexpectedly") //since we did not tell it to shut down yet
-		fiber = nil
+		slog.Error("Request processor terminated unexpectedly") //since we did not tell it to shut down yet
+		server = nil
 	}
 	
 	var buf bytes.Buffer
 	myMetrics.WritePrometheus(&buf)
 	slog.Info("Stopping", "metrics", buf.String())
 	
-	if fiber != nil {
-		if err := fiber.Shutdown(); err != nil {
-			slog.Error("Error while shutting down HTTP server", "error", err)
+	if server != nil {
+		if err := server.Shutdown(); err != nil {
+			slog.Error("Error while shutting down request server", "error", err)
 		}
 	}
 	processor.Close()
@@ -112,4 +132,23 @@ func LoadConfig(path string) (*server.Config, error) {
 	}
 
 	return &cfg, nil
+}
+
+type NoOpProcessor struct {
+}
+
+func (p *NoOpProcessor) Request(key string, amount int32) server.Response {
+	return server.Response { Granted: 0 }
+}
+
+func (p *NoOpProcessor) Close() {
+	//Do nothing
+}
+
+type NoOpServer struct {
+}
+
+func (p *NoOpServer) Shutdown() error {
+	//Do nothing
+	return nil
 }

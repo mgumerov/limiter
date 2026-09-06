@@ -1,28 +1,30 @@
 package server
 
 import (
-	"fmt"
-	"log/slog"
-	"strconv"
-
 	"time"
-
-	"github.com/gofiber/fiber/v3"
-	recoverer "github.com/gofiber/fiber/v3/middleware/recover"
-
-	"github.com/VictoriaMetrics/metrics"
 )
 
 type Response struct {
 	Granted int32
 }
 
+// In worker-pool approach, worker goroutines never complete, but they are reused and that saves some allocations etc.
+// In semaphore-protected approach, answering routines are completed and cleanly recreated, that's cleaner
+//  (no need to guarantee goroutine will not die out of panic) but more expensive.
+// Also, since I don't want more than 1 request processed at each moment, I can use mutex-protected approach. 
+//  It does not use allocations and does not need goroutine creation at all, and appears like most efficient solution.
+// What do I pick? I'll allow selecting between worker-pool and mutex, because I have some reservation about mutex drawbacks 
+//  and need to do measurements.
 type Processor interface {
 	Request(key string, amount int32) Response
 
 	//Relies on no concurrent/subsequent calls to request()
 	//(if that is idiomatic expectation then we don't need that comment)
 	Close() //close is the idiomatic name for stopping lifecycle and releasing resources
+}
+
+type Server interface {
+	Shutdown() error
 }
 
 type Config struct {
@@ -64,79 +66,6 @@ func Refill (bucket *Bucket, now time.Time) {
 	}
 }
 
-//TODO better move to main or somewhere else
-func CreateHTTP(processor Processor, fiberFailed chan<- struct{}, myMetrics *metrics.Set) *fiber.App {
-	handlerTime := myMetrics.NewHistogram("handler_time")
-
-	app := fiber.New()
-
-	app.Use(recoverer.New(recoverer.Config {
-		PanicHandler: 
-			func(c fiber.Ctx, r any) error {
-				fiberFailed <- struct{}{}
-				//Since panics are worse situation in Go than say Java exceptions, we don't look at the error and deduce what
-				// happened and what details to give our client; we don't give any
-				return fiber.ErrInternalServerError
-			}}));
-
-	//Actually, different buckets could be served by different dedicated workers, especially since there are no causality requirements
-	// between requesting from them. Instead, we'll keep serving them all from same thread, to avoid overcomplicating this
-	// PoC work, because otherwise we need to consider it carefully (also we could serve different APIs from different shards).
-	handler := func (key string, amount int32, c fiber.Ctx) error {
-		start := time.Now()
-		slog.Debug("Serving request", "key", key, "amount", amount)
-		result := processor.Request(key, amount)
-		handlerTime.UpdateDuration(start)
-	
-		if result.Granted == amount {
-			return c.SendStatus(fiber.StatusOK)
-		} else {
-			//TODO headers like x-ratelimit-*
-			c.Set("X-RateLimit-Granted", strconv.Itoa(int(result.Granted)))
-			return c.SendStatus(fiber.StatusTooManyRequests)
-		}
-	}
-	
-	//Use POST, not GET, because of read-only and idempotency requirements of HTTP, and because request body allows to send more data and in a safer way.
-	//TODO better move parameter to POST body
-	app.Post("/:key", func(c fiber.Ctx) error {
-		q, err := strconv.ParseInt(c.Query("q", "1"), 10, 32)
-		if err != nil {
-			return fmt.Errorf("Amount parse error: %w", err)
-		}
-		return handler(c.Params("key"), int32(q), c)
-	})
-	//However, for debugging purposes GET is sometimes more convenient, while under heavy development
-	app.Get("/:key", func(c fiber.Ctx) error {
-		q, err := strconv.ParseInt(c.Query("q", "1"), 10, 32)
-		if err != nil {
-			return fmt.Errorf("Amount parse error: %w", err)
-		}
-		return handler(c.Params("key"), int32(q), c)
-	})
-
-	return app
-}
-
-//TODO better move to main or somewhere else
-func StartHTTP(http *fiber.App, fiberFailed chan<- struct{}, cfg *Config) {
-	go func() {
-		defer func() { //always report termination
-			//We still want to attempt a controlled termination in main routine, not just crash the app right here
-			if r := recover(); r != nil {
-        	    slog.Error("HTTP server panicked", "error", r)
-				fiberFailed <- struct{}{}
-        	}
-		} ()
-			
-		//startup errors return non-nil, graceful shutdown returns nil, shutdown errors are only returned via shutdown() - not here
-		if err := http.Listen(fmt.Sprintf(":%d", cfg.Port)); err != nil {
-			slog.Error("HTTP server startup failed", "error", err)
-			fiberFailed <- struct{}{}
-		}
-	}()
-}
-
 //TODO: mutex + fast path (or maybe CAS)
 //TODO: config for acceptance limit Q (max sum quota) and acceptance multiplier K; load shedding over capacity = L * K
 //      (google's default is K=2.0, provided that rejection path is much shorter than acceptance path, but I'll need to measure
@@ -147,13 +76,7 @@ func StartHTTP(http *fiber.App, fiberFailed chan<- struct{}, cfg *Config) {
 //.        clients; that's bad, but if it's good enough compromise for Google, I'll take it. 
 //         Thus, picking good value for K must be tuned for each specific system, minding how compliant the clients are expected to be. 
 
-/*
-type ComplexRequest struct {
-    UserID int32  `uri:"id"`        // Extracted from path: /users/:id
-    Search string `query:"search"`  // Extracted from query string: ?search=abc
-    Role   string `header:"X-Role"` // Extracted from HTTP headers
-}
-*/
+
 
 //wget https://storage.googleapis.com/hey-releases/hey_linux_amd64
 //chmod +x hey_linux_amd64
@@ -256,3 +179,78 @@ type ComplexRequest struct {
 // То есть я частично прав, половина запросов отрабатывают за 2.5 микросекунды. Но это все равно при умножении
 // на 50к будет в разы больше чем 51 мс (чистое время процессинга). В разы - но не на порядок. То есть существует какой-то
 // fast-path, но он реализуется лишь иногда при такой нагрузке.
+
+// Провел тест реализации на мьютексах. Значимых отличий по линейности не увидел, так что время ожиданий получается такое же :(
+// Но!
+// P95 теперь ниже 2мкс!
+// P99 - 21 мкс
+// MAX в районе 800мкс
+
+// Но тогда у меня вопрос =))) а что тогда тормозит? =) Я еще мог поверить что 50% медленных запросов создают общее время выполнения
+// теста более 1 сек, но теперь-то медленных запросов в 100 раз меньше чем быстрых!
+// Неужели бОльшую часть задержек создает сеть?
+// Это бы объяснило скорость теста (если всякий раз клиент ждет ответа и лишь потом запускает новый запрос)
+// но не объясняет перегиб на сервере. Почему сервер-то не может больше обработать?
+
+// Хм ну вот я делаю 300 запросов и 1 конекшен - это занимает 1 секунду!
+// Но тут все ясно, один поток последовательно не может запустить больше, это ограничение сети или интерфейса
+// 10 потоков ровно так же за секунду отрабатывают и 100 тоже
+// но вот 1000 потоков уже 2.5 сек
+// 500 потоков чуть более 1 сек
+// 250 потоков - без перегиба тоже 1 сек
+
+// Далее не важно - то ли добавить еще 250 конекшенов то ли второй такой инстанс запустить - все равно 500 уже уходит за 1 сек
+// Но возьмем вот этот вариант с 250
+// Почему такой тест занимает 1 сек?
+// Не потому что на обработку 75к запросов нужно 1 сек
+// А потому что каждый из 250 клиентов не может слать запросы быстрее!
+
+// Аааа блин я ж сам ему сказал - шли в секунду 300 запросов =) Он никак не может работать быстрее чем за 1 сек =)))
+// (Правда остается вопрос почему излом на сервере)
+// Что если сказать больше?
+
+// начиная с 1000 запросов на конекшен - он уже захлебывается
+// 750 - нормально
+// и 7500 с 10 клиентами - тоже линейно
+// 75к со 100 клиентами - уже нелинейно (немножко)
+// GOMAXPROCS=7 hey -n 75000 -c 100 -q 750 -m POST "http://51.250.88.215:3000/api1"
+// Но мы помним что сервер без нагрузки линейно принимал до 88к/сек при такой конфигурации
+
+// Итак, линейность при 44+44 мы все еще имеем, а при бОльших все еще нет - но это уже может упираться в сеть
+// Причем тесты показали сейчас, что без полезной нагрузки (No-op processor) и с ней предел примерно одинаковый :(
+// Невозможно выбирать лучшее решение, если сеть не дает нагрузить как следует.
+// Хотя можно по гистограмме ориентироваться (например что 95% запросов или только 50% выполняются быстрее 10 мкс)
+// но это не совсем четкий пруф как оно себя поведет в реальной работе.
+
+// Значит перейдем на внутренние самотесты
+// исключая сеть
+// возможно вообще уберем из уравнения hey и fiber и будем напрямую вызывать хендлеры из разных потоков
+// жаль только что это создаст эффект самоглушения - конкуренции за ресурсы
+// или не создаст?
+// там конкуренция была из-за общего сетевого стека а тут общий будет только CPU
+// если мы скажем выделим ровно N машин под лимитер и ровно M под запуск тестов то мешать не будут (или минимально)
+// но возникнет вопрос как один процесс будет дергать второй без сетевого стека?
+// А нужно ли два процесса?
+// - Хендлер выполняется в той же рутине которая вызвала хэндлер, правда мы не знаем какое
+// количество горутин файбер выделяет под это, чтобы выделить столько же. А так - если мы просто на верхнем уровне каждой горутины
+// сделаем цикл и будем вызывать хендлер (не через сеть), это не сворует у сервера практически никаких ресурсов кроме лишнего Call.
+// Второй процесс не нужен. Но надо бы понять как реалистично сделать столько же горутин как в файбере.
+
+// А все просто. У нас же HTTP 1.1 пока что, и без пайплайнинга (а если и с ним - файбер обрабатывает запросы последовательно), 
+// поэтому fiber обслуживает каждый коннекшен одной горутиной, и так как мы знаем из настройки hey сколько коннекшенов использовать,
+// то знаем сколько горутин использовать. Остается в них добавить такую же логику лимитинга простенькую чтобы равномерно раскидывать,
+// как в hey (да или просто как в моем же алгоритме!), и все.
+
+// Можно даже готовую либу вроде F1 использовать, потому что тогда весь тест это 10-liner который к тому же умеет 
+// брать параметры запуска из командной строки
+// Вот я прогнал локальные тесты как делал удаленно - скажем (2x128)x350 - это прицел в 88k запросов в секунду
+// P=M S=T go run . run constant tests --rate 88000/s  --concurrency 256
+// => p50 = 375 нс (!), p90 = 25 мкс, p97 = 1.2 мс, p99 = 2.6 мс, max= 7 мс 
+// Далее эту нагрузку УДВОИЛ и все равно за 992 мс выполнил 176к запросов,
+// => p99 = 3мс, max = 15 мс, а в целом так же
+// 350K => теперь уже max=12 мс, в остальном распределение то же
+// 700K => аналогично
+// 3М это максимум который я успеваю уложить в 1с (предел линейности = capacity), и на нем
+// => p50 = 208 нс (все еще!), p90 = 6 мкс (все еще!), p97 = 755 мкс, p99 = 2 мс, max = 11 мс (в сущности хуже не стало!)
+
+// Ну это было с M процессором, теперь нужно сравнить с W - сколько успеет разгрести он
