@@ -18,7 +18,6 @@ var _ server.Processor = (*MutexProcessor)(nil) //fail-fast type guard
 
 func StartMutexProcessor(processorFailed chan<- struct{}, cfg *server.Config, myMetrics *metrics.Set) *MutexProcessor {
 	buckets := make(map[string]server.Bucket)
-
 	startedAt := time.Now()
 	for key, limit := range cfg.APIs {
 		//We could start with startedAt=0, but then one of two things happen

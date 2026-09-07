@@ -12,6 +12,7 @@ import (
 	"github.com/VictoriaMetrics/metrics"
 	"gopkg.in/yaml.v3"
 
+	"limiter/casproc"
 	"limiter/fiberserver"
 	"limiter/mutexproc"
 	"limiter/server"
@@ -50,6 +51,7 @@ func main() {
 	switch v := os.Getenv("P"); v {
 	case "W": processor = workerproc.StartWorkerProcessor(processorFailed, cfg, myMetrics)
 	case "M": processor = mutexproc.StartMutexProcessor(processorFailed, cfg, myMetrics)
+	case "C": processor = casproc.StartCasProcessor(processorFailed, cfg, myMetrics)
 	case "N": processor = &NoOpProcessor{}
 	default:
 		slog.Error("Invalid request processor specified in env", "P", v)

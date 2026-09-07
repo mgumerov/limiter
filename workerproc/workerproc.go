@@ -20,7 +20,7 @@ type Request struct {
 }
 
 func StartWorkerProcessor(processorFailed chan<- struct{}, cfg *server.Config, myMetrics *metrics.Set) *WorkerProcessor {
-	reqChan := make(chan Request) //unbuffered, because what good such buffering is - under heavy load?
+	reqChan := make(chan Request) //Unbuffered, because what good such buffering is - under heavy load? Verified it by load testing with buffer of 1.
 	ptime := myMetrics.NewSummary("processing_time")
 	
 	//Process all requests sequentially by a single goroutine
