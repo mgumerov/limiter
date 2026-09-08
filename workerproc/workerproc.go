@@ -19,6 +19,8 @@ type Request struct {
 	reply chan<- server.Response
 }
 
+//Like Processor interface says, the created instance is thread safe to use but still has to be published safely.
+//See Request function here for details.
 func StartWorkerProcessor(processorFailed chan<- struct{}, cfg *server.Config, myMetrics *metrics.Set) *WorkerProcessor {
 	reqChan := make(chan Request) //Unbuffered, because what good such buffering is - under heavy load? Verified it by load testing with buffer of 1.
 	ptime := myMetrics.NewSummary("processing_time")
@@ -89,6 +91,10 @@ func StartWorkerProcessor(processorFailed chan<- struct{}, cfg *server.Config, m
 	return &WorkerProcessor { rqChan: reqChan }
 }
 
+
+//All actual processing in this Processor is performed on one goroutine; however the Request func (the one feeding data to it) 
+// is still called from any number of goroutines, therefore such a goroutine might not see initialized field p.rqChan 
+// unless safe publication to that goroutine is somehow ensured.
 func (p *WorkerProcessor) Request(key string, amount int32) server.Response {
 	//buffered, because it makes no sense to block when responding, however little are chances;
 	// also, this avoids depending on the receiving side _still being alive_ (might have panicked or whatever)

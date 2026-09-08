@@ -16,6 +16,10 @@ type MutexProcessor struct {
 }
 var _ server.Processor = (*MutexProcessor)(nil) //fail-fast type guard
 
+//Like Processor interface says, the created instance is thread safe to use but still has to be published safely.
+// Just guarding Request method with a mutex does not mean it happens-after initialization of all fields of MutexProcessor
+// in absence of any other guarantees; of course we could guard its construction here with the very same mutex 
+// and that would solve the problem, but thankfully the clause in the interface lets us just rely on safe publication instead.
 func StartMutexProcessor(processorFailed chan<- struct{}, cfg *server.Config, myMetrics *metrics.Set) *MutexProcessor {
 	buckets := make(map[string]server.Bucket)
 	startedAt := time.Now()

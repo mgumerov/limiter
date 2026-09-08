@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 
 	"github.com/VictoriaMetrics/metrics"
@@ -51,7 +52,16 @@ func main() {
 	switch v := os.Getenv("P"); v {
 	case "W": processor = workerproc.StartWorkerProcessor(processorFailed, cfg, myMetrics)
 	case "M": processor = mutexproc.StartMutexProcessor(processorFailed, cfg, myMetrics)
-	case "C": processor = casproc.StartCasProcessor(processorFailed, cfg, myMetrics)
+	case "C": {
+		r := os.Getenv("R")
+		retries, err := strconv.Atoi(r)
+		if err != nil {
+			slog.Error("Invalid retries count specified in env", "R", r)
+			processor = &NoOpProcessor{} //still create a stub to be safely passed as dependency
+			processorFailed <- struct{}{}
+		}
+		processor = casproc.StartCasProcessor(processorFailed, cfg, myMetrics, retries)
+	}
 	case "N": processor = &NoOpProcessor{}
 	default:
 		slog.Error("Invalid request processor specified in env", "P", v)

@@ -13,9 +13,10 @@ import (
 )
 
 type TestServer struct {
-	processor server.Processor
+	processor   server.Processor
 	handlerTime *metrics.Summary //maybe histogram? also, might introduce extra delays and contention
 }
+
 var _ server.Server = (*TestServer)(nil) //fail-fast type guard
 
 type TestResult struct {
@@ -28,22 +29,28 @@ func CreateTestServer(processor server.Processor, serverFailed chan<- struct{}, 
 	//I tried to use VictoriaMetrics here, but looks like it involves locking whole Summary to add each measurement, and
 	// it becomes a massive source of contention.
 	var handlerTime = myMetrics.NewSummary("handler_time")
-	var timecounts [1+0x1f]chan TestResult
+	var timecounts [1 + 0x1f]chan TestResult
 	for i := range timecounts {
 		timecounts[i] = make(chan TestResult, 10*1000*1000)
 	}
+
+	//Note: "granted" is populated only after the test runs. If the test engine aborts due to errors, granted may be underfilled. Rely on it only upon successful execution.
 	var granted = myMetrics.NewCounter("granted")
-	
-	setupTest := func (t *testing.T) testing.RunFn {
+
+	//Because this test-setup function gets called from a goroutine that will be created later (by F1) down the path of this goroutine,
+	// that goroutine's launch (go xxx) happens-after what happened before this point on execution path;
+	// and this test-setup function also happens-after even that, meaning it obverves fully initialized "processor",
+	// so the safe publication requirement is satisfied.
+	setupTest := func(t *testing.T) testing.RunFn {
 		return func(t *testing.T) {
 			var start = time.Now()
 			var response = processor.Request("api1", 1)
 			stretch := time.Since(start).Nanoseconds()
 			//We add to "stretch" just for better distribution - to avoid millions of 0's going into same bucket
-			timecounts[(stretch + int64(start.Nanosecond())) & 0x1f] <- TestResult { stretch: stretch, granted: int(response.Granted) }
+			timecounts[(stretch+int64(start.Nanosecond()))&0x1f] <- TestResult{stretch: stretch, granted: int(response.Granted)}
 		}
 	}
-	
+
 	go func() {
 		if err := f1.New().Add("tests", setupTest).ExecuteWithArgs(os.Args[1:]); err != nil {
 			slog.Error("Unable to start F1 tests", "error", err)
@@ -53,11 +60,11 @@ func CreateTestServer(processor server.Processor, serverFailed chan<- struct{}, 
 		slog.Info("Gathering handler statistics")
 		//the goroutine started after the slice had been populated, so it observes it
 		for i := range timecounts {
-			drain:
+		drain:
 			for {
 				select {
-				case result := <- timecounts[i]:
-					handlerTime.Update(float64(result.stretch) / float64(time.Second.Nanoseconds()));
+				case result := <-timecounts[i]:
+					handlerTime.Update(float64(result.stretch) / float64(time.Second.Nanoseconds()))
 					granted.Add(result.granted)
 				default:
 					break drain
@@ -77,4 +84,3 @@ func (s *TestServer) Shutdown() error {
 	// Anyway, this "server" is just for benchmarking.
 	return nil
 }
-

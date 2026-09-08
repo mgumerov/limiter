@@ -19,6 +19,10 @@ var _ server.Server = (*fiber.App)(nil) //fail-fast type guard
 
 func CreateFiberServer(processor server.Processor, fiberFailed chan<- struct{}, cfg *server.Config, myMetrics *metrics.Set) server.Server {
 	fiber := createHTTP(processor, fiberFailed, myMetrics)
+	//This creates (or eventually creates) Fiber's goroutines that will then execute our functions which in turn access Config
+	// and Processor's state. Because starting a goroutine is sequenced-after any code leading to it, and serialized-before the goroutine's
+	// code, the goroutine will observe everything this method currently observes (in terms of concurrency). 
+	// Meaning, processor is safely published to that goroutine as its contract requires.
 	startHTTP(fiber, fiberFailed, cfg)
 	return fiber
 }
