@@ -1,7 +1,6 @@
 package casproc
 
 import (
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -45,7 +44,6 @@ type CasProcessor struct {
 	// entries, forcing us to replace the whole entry (=read struct and write changed struct), effectively invalidating the approach.
 	// So in this processor we store pointers in the map. It's still not that bad, because those extra allocations are only made once.
 	buckets map[string]*Bucket
-	m sync.Mutex
 	cfg *server.Config
 	retries int
 	lostAdding *metrics.Counter
@@ -101,6 +99,10 @@ func StartCasProcessor(processorFailed chan<- struct{}, cfg *server.Config, myMe
 //  or use mutexes/channels/WaitGroups to wait for completion of construction (no actual waiting should actually happen);
 //  and mutex/channel alone will be a bit constly even on a fast path (because this is very fast function) - WaitGroup would be better
 //  or we could combine a boolean atomic flag with mutex/channel to act as fast path.
+// And yes I am aware that I might have tried doing something with my data types and manage to squeeze <Count, Issued> into 64 bits,
+//  thus making algorithm simpler and more atomic, but the beauty here is in NOT doing that. Everyone can do base value substractions
+//  and bit shifts (and that is not something in real demand these days), not everyone can come up with concurrent algorithm not relying
+//  on being atomic and surviving explicitly pipelinining its work in time.
 func (p *CasProcessor) Request(key string, amount int32) server.Response {
 	//Make own copy
 	pBucket, ok := p.buckets[key]
