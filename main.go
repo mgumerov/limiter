@@ -14,6 +14,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"limiter/casproc"
+	"limiter/consensus"
 	"limiter/fiberserver"
 	"limiter/mutexproc"
 	"limiter/server"
@@ -47,6 +48,20 @@ func main() {
 	// accumulate time via some cheaper means and periodically dump it to metrics.
 	var myMetrics = metrics.NewSet()
 
+	nctx, stop := signal.NotifyContext(
+		context.Background(),
+		os.Interrupt,
+		syscall.SIGTERM, //sadly no platform-neutral os.* constant for this; even though actually Go translates to SIGTERM on Windows
+	)
+	defer stop() //we won't need this context after this function completes
+
+	//Create nested context so that we could cancel it even when shutdown is not initiated by a signal
+	ctx, cancel  := context.WithCancel(nctx)
+	defer cancel()
+
+	trackerFailed := make(chan struct{}, 1)
+	tracker := consensus.StartMasterLeaseLoop(ctx, trackerFailed, cfg)
+
 	processorFailed := make(chan struct{}, 1)
 	var processor server.Processor
 	switch v := os.Getenv("P"); v {
@@ -68,24 +83,11 @@ func main() {
 		processor = &NoOpProcessor{} //still create a stub to be safely passed as dependency
 		processorFailed <- struct{}{}
 	}
+
+	//Rather than make each Processor verify holding master's mantle, we decorate whatever Processor has been constucted 
+	// with orthogonal middleware (cross-cutting concern) for verification, leaving Processor and consensus-tracker uncoupled.
+	processor = &GuardedProcessor { next: processor, tracker: tracker }
 	
-	//The remainder of this function could be just fiber.Listen(), but Fiber v2 does not listen context for graceful
-	// shutdown, neither does it return control after inialization. So, decided to move its startup into a goroutine
-	// completely and provide means for watching for subsequent failure of this or other subsystems.
-	//But, fiber V3 actually knows how to listen for graceful shutdown; meaning, if we accept 
-	// it as our only "blind-launch" but critical service, we could skip it all and just fiber.Listen()
-	// right here, since we won't be needing to wait for some other events in parallel.
-	//In the end, I decided to take the longer route because I want to be able to use other engines than Fiber,
-	// so I don't want it to transform my main routine into Fiber's event loop. Besides, this requires me to
-	// learn how to cope with related problems.
-
-	ctx, stop := signal.NotifyContext(
-		context.Background(),
-		os.Interrupt,
-		syscall.SIGTERM, //sadly no platform-neutral os.* constant for this; even though actually Go translates to SIGTERM on Windows
-	)
-	defer stop() //we won't need this context after this function completes
-
 	//Idiomatic approach says passing contexts along (here, or/and to fiber.Listen) because this clearly involves some 
 	// i/o and long activity. But actually it depends on how the called func will use the context: maybe I am passing 
 	// request-scoped context to some async processing, for example. In this case, passing globally-scoped notify-context 
@@ -109,19 +111,31 @@ func main() {
 		server = nil
 	case <- processorFailed:
 		slog.Error("Request processor terminated unexpectedly") //since we did not tell it to shut down yet
-		server = nil
+		processor = nil
+	case <- trackerFailed:
+		slog.Error("Consensus-tracking engine failed")
+		tracker = nil
 	}
-	
+
 	var buf bytes.Buffer
 	myMetrics.WritePrometheus(&buf)
 	slog.Info("Stopping", "metrics", buf.String())
+
+	// If the outer (notifying-context) had been cancelled, this will do nothing but won't hurt; 
+	//  if however it had not been cancelled (i.e. we got here because of serverFailed etc.), cancel the nested context.
+	cancel()
 	
+	// The cancellation of context will stop all our subsystems that are watching that context,
+	//  but others we have to stop explicitly.
 	if server != nil {
 		if err := server.Shutdown(); err != nil {
 			slog.Error("Error while shutting down request server", "error", err)
 		}
 	}
-	processor.Close()
+	if processor != nil {
+		processor.Close()
+	}
+
 }
 
 func LoadConfig(path string) (*server.Config, error) {
@@ -161,6 +175,23 @@ type NoOpServer struct {
 }
 
 func (p *NoOpServer) Shutdown() error {
-	//Do nothing
 	return nil
+}
+
+type GuardedProcessor struct {
+	next server.Processor
+	tracker server.ConsensusTracker
+}
+
+func (p *GuardedProcessor) Request(key string, amount int32) server.Response {
+	if !p.tracker.IAmMaster() {
+		//TODO think of some way of signaling that the client is using the wrong instance of server and it's not normal 429
+		// maybe some HTTP response codes are already well suited for that
+		return server.Response { Granted: 0 }
+	}
+	return p.next.Request(key, amount)
+}
+
+func (p *GuardedProcessor) Close() {
+	p.next.Close()
 }

@@ -3,3 +3,10 @@ max_requests: 30000
 api:
   api1: 3300000
   api2: 0
+etcd:
+  endpoints:
+    - "localhost:2379"
+  #  - "localhost:22379"
+  #  - "localhost:32379"
+  dial-timeout: 5s
+etcd-key: limiter

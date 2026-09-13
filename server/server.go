@@ -2,6 +2,7 @@ package server
 
 import (
 	"time"
+	etcd "go.etcd.io/etcd/client/v3"
 )
 
 type Response struct {
@@ -35,6 +36,8 @@ type Config struct {
 	Port       int              `yaml:"port"`
 	MaxRequest int32            `yaml:"max_requests"`
 	APIs       map[string]int32 `yaml:"api"`
+	ETCD	   etcd.Config     `yaml:"etcd"`
+	ETCDkey	   string			`yaml:"etcd-key"`
 }
 
 type Bucket struct {
@@ -42,6 +45,10 @@ type Bucket struct {
 	Limit     int32
 	StartedAt time.Time
 	Issued    int64
+}
+
+type ConsensusTracker interface {
+	IAmMaster() bool
 }
 
 // TODO: how critical can possible time leap be? Like, in "leap second" or "switch to daylight time"
@@ -78,3 +85,25 @@ func Refill(bucket *Bucket, now time.Time) {
 //.      * Setting the capacity closer to Q, however, means load-shedding is more likely to happen, and it can hurt well-behaving
 //.        clients; that's bad, but if it's good enough compromise for Google, I'll take it.
 //         Thus, picking good value for K must be tuned for each specific system, minding how compliant the clients are expected to be.
+
+// Итак мы должны создать где-то клиента
+// В конце отпустить
+// Ну а пока он нужен - какая схема?
+
+// Мы как обычно делаем то что делаем, а в начале всего этого берем аренду. Ну то есть если взяли, то делаем что обычно делаем.
+// И пытаемся продлевать аренду в фоне.
+// Если очередное продление не получается - запускаем шатдаун.
+
+// Или так
+// Мы как обычно делаем то что делаем
+// Вначале мы не мастер
+// Когда приходит запрос - мы смотрим, и если видим что мы не мастер - сразу отлуп (429 или 500 или код для not ready) - желательно
+// такой код чтобы получатель понял что надо выбрать другой инстанс
+// Затруднение тут это дополнительный флаг который надо синхронизированно читать
+
+// В фоне цикл который пытается захватить лидерство
+// если получается - он взводит флаг и дальше пытается продлевать аренду. Если очередное продление не прокатывает - мы превентивно сразу сбрасываем 
+// флаг, чтобы у нас осталось еще скажем 0.2 сек на то чтобы доработали текущие уже запущенные запросы, но новые уже не будем удовлетворять
+// и тогда снова возвращаемся к этапу "попытаться захватить лидерство"
+// при этом ломиться в лидеры постоянно смысла нет, мы должны прочитать когда заканчивается текущая аренда и подождать до этого момента и лишь
+// потом пробовать. В этот период же не нужен хартбит? (или его вообще делают прозрачно для нас?)

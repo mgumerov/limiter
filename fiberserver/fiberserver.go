@@ -95,6 +95,7 @@ func startHTTP(http *fiber.App, fiberFailed chan<- struct{}, cfg *server.Config)
 		} ()
 			
 		//startup errors return non-nil, graceful shutdown returns nil, shutdown errors are only returned via shutdown() - not here
+		//TODO now we can switch this to detectint cancellation via passed context, Fiber had a config option for that
 		if err := http.Listen(fmt.Sprintf(":%d", cfg.Port)); err != nil {
 			slog.Error("HTTP server startup failed", "error", err)
 			fiberFailed <- struct{}{}

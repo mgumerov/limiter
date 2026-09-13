@@ -56,7 +56,7 @@ func CreateTestServer(processor server.Processor, serverFailed chan<- struct{}, 
 			slog.Error("Unable to start F1 tests", "error", err)
 			serverFailed <- struct{}{}
 		}
-
+		
 		slog.Info("Gathering handler statistics")
 		//the goroutine started after the slice had been populated, so it observes it
 		for i := range timecounts {
