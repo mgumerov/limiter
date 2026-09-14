@@ -58,7 +58,7 @@ func main() {
 	//Create nested context so that we could cancel it even when shutdown is not initiated by a signal
 	ctx, cancel  := context.WithCancel(nctx)
 	defer cancel()
-
+		
 	trackerFailed := make(chan struct{}, 1)
 	tracker := consensus.StartMasterLeaseLoop(ctx, trackerFailed, cfg)
 

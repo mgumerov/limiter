@@ -25,7 +25,6 @@ type TestResult struct {
 }
 
 func CreateTestServer(processor server.Processor, serverFailed chan<- struct{}, cfg *server.Config, myMetrics *metrics.Set) server.Server {
-
 	//I tried to use VictoriaMetrics here, but looks like it involves locking whole Summary to add each measurement, and
 	// it becomes a massive source of contention.
 	var handlerTime = myMetrics.NewSummary("handler_time")
@@ -52,6 +51,8 @@ func CreateTestServer(processor server.Processor, serverFailed chan<- struct{}, 
 	}
 
 	go func() {
+		time.Sleep(time.Duration(3) * time.Second) //Do not start at once, because of slow ectd handshake
+
 		if err := f1.New().Add("tests", setupTest).ExecuteWithArgs(os.Args[1:]); err != nil {
 			slog.Error("Unable to start F1 tests", "error", err)
 			serverFailed <- struct{}{}

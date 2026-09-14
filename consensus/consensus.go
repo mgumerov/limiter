@@ -8,16 +8,18 @@ import (
 	"sync/atomic"
 	"time"
 
+	mvccpb "go.etcd.io/etcd/api/v3/mvccpb"
 	"go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	etcd "go.etcd.io/etcd/client/v3"
-	mvccpb "go.etcd.io/etcd/api/v3/mvccpb"
 )
 
 type EtcdConsensusTracker struct {
-	IsMaster atomic.Bool
+	lease atomic.Pointer[Lease]
 }
 var _ server.ConsensusTracker = (*EtcdConsensusTracker)(nil) //fail-fast type guard
 
+//TODO !!! Ok but now I am not using standard KeepAlive loop - update this
+//
 //Here is where I will compromise. Problem is, etcd is not built for sub-second TTLs - even if I set a very brief
 // leader election timeout of under 600s, it will only mean TTL=1 seconds. Meaning, if our cluster gets a split-brain right
 // after lease starts, this instance will grant tickets for 1 more seconds. In this limiter service it's no problem because 
@@ -32,6 +34,11 @@ var _ server.ConsensusTracker = (*EtcdConsensusTracker)(nil) //fail-fast type gu
 // something outside normal approach, despite those concerns. I will simply try to request a 1-second TTL, even though I'll probably 
 // end up granted with at least 2 or 3 seconds instead.
 const LEASE_TIME_REQUEST = 1
+
+//TODO Configurable
+//TODO time.Minute would be better in the long run, but it seems that first attempts are suffering context deadline because initial client handshake is rather slow,
+// so they will have to wait and that's bad; progressive backoff might be a good idea.
+const ETCD_BACKOFF = 1 * time.Second 
 
 func StartMasterLeaseLoop(ctx context.Context, failed chan struct{}, cfg *server.Config) server.ConsensusTracker {
 	if cfg.ETCDkey == "" {
@@ -58,12 +65,15 @@ func StartMasterLeaseLoop(ctx context.Context, failed chan struct{}, cfg *server
 		//Eventually I came to this approach. See end of file for (1) with explanation of alternatives
 		//Loop invariant: this instance does not hold an active lease supporting this instance's claim of ownership (lease-guarded key in etcd)
 		for ctx.Err() == nil {			
-			//TODO use WithRequireLeader context maybe?
-			offendingKey, err := captureKeyAndKeepSupporting(cli, cfg.ETCDkey, ctx)
+			//TODO use WithRequireLeader context maybe?Etcd key capture failed
+			offendingKey, err := tracker.tryCaptureAndHold(cli, cfg.ETCDkey, ctx)
 			if err != nil {
-				//???
+				slog.Error("Etcd key capture failed", "Error", err)
+				sleep(ETCD_BACKOFF)
+				continue
 			}
 			if offendingKey != nil {
+				slog.Info("Another instance holds the key", "Key", offendingKey)
 				waitForKeyDeletion(cli, offendingKey, ctx)
 			}
 		}
@@ -72,18 +82,28 @@ func StartMasterLeaseLoop(ctx context.Context, failed chan struct{}, cfg *server
 	return &tracker
 }
 
-type Lease struct {
-	ID      etcd.LeaseID
+func sleep(d time.Duration) {
+	t := time.NewTicker(d)
+	defer t.Stop()
+	<- t.C
+}
 
-	//Note that Go's time maintains monotonic clock (*) and thus helps handle time leaps. 
-	// It even uses monotonic clock in time comparisons (of course only so far as Equals/Before/etc predicates are concerned).
-	// Otherwise we might time-travel 1 hour back (say because of taking a flight somewhere)
-	// and happily continue serving requests for 1 hour after our 1-second lease has long expired.
-	// (*) Or rather it does IF the Time instance contains it. This one does, and so does time.Now().
-	//Also note that this should not be regarded as precise moment of expiration, but rather a close approximation from below.
-	// We don't get to know what moment ETCD counts this lease's TTL from, and even if we did - our clock might drift from theirs,
-	// but we can pick some moment which is both close to true expiration and still is before it.
-	Expires time.Time //This instance's local time, not ETCD's
+type Lease struct {
+	ID      	etcd.LeaseID
+	Requested  	time.Time		//Must contain monotonic clock. For example, time.Now() does.
+	TTL			time.Duration
+}
+
+//Note that Go's time maintains monotonic clock (*) and thus helps handle time leaps. 
+// It even uses monotonic clock in time comparisons (of course only so far as Equals/Before/etc predicates are concerned).
+// Otherwise we might time-travel 1 hour back (say because of taking a flight somewhere)
+// and happily continue serving requests for 1 hour after our 1-second lease has long expired.
+// (*) Or rather it does IF the Time instance contains it.
+//Also note that this should not be regarded as precise moment of expiration, but rather a close approximation from below.
+// We don't get to know what moment ETCD counts this lease's TTL from, and even if we did - our clock might drift from theirs,
+// but we can pick some moment which is both close to true expiration and still is before it.
+func (l *Lease) Expires() time.Time {
+	return l.Requested.Add(l.TTL)
 }
 
 //Note: there is no guarantee that the returned lease did not yet run out! If this function worked slowly enough and the lease TTL is very
@@ -105,15 +125,19 @@ func acquireLease(cli *etcd.Client) (Lease, error) {
 	// at the same time we can be reasonably sure it's close to the true mark.
 	return Lease { 
 		ID: resp.ID, 
+		Requested: rqTime, //rqTime is Now() so it contains monotonic clock, as the Lease contract requires
 		//This looks awkward but said to be most idiomatic way, even though it creates a transient Duration of X nanos despite X being measured in seconds.
 		// But on a side note, it's justifiable: 
 		// X seconds =  X * 1 Sec = X * (1 Nano) * 1 Sec / (1 Nano) = (X Nanos) * (exactly one of time constants "how many nanos in *")
-		Expires: rqTime.Add(time.Duration(resp.TTL) * time.Second),
+		TTL: time.Duration(resp.TTL) * time.Second,
 	}, nil
 }
 
 //If a key has been created, returns nil; if a key already existed, returns its metadata at the version at the moment of attempt
 func createKey(cli *etcd.Client, keyname string, lease Lease) (*mvccpb.KeyValue, error) {
+	if lease.ID == 0 {
+		return nil, fmt.Errorf("lease ID = 0 on input")
+	}
 	//todo timeout and what it means for us
 	txnResp, err := cli.KV.Txn(context.Background()).
 		//Beware of "version" vs "revision" (as in CreateRevision/ModRevision), the latter two are not reset if a key is deleted,
@@ -122,16 +146,27 @@ func createKey(cli *etcd.Client, keyname string, lease Lease) (*mvccpb.KeyValue,
 		Then(etcd.OpPut(keyname, "test" /*maybe lease ID? to compare. But we have one in bound lease and maybe can read it from there?*/, etcd.WithLease(lease.ID))).
 		Else(etcd.OpGet(keyname, etcd.WithKeysOnly())). //return metadata about offending key; do not return its value
 		Commit()
+	if err != nil {
+		return nil, err
+	}
 	var key *mvccpb.KeyValue
 	if !txnResp.Succeeded { //in this case I asked to fetch version, it's the only items in Responses
 		key = txnResp.Responses[0].GetResponseRange().Kvs[0] //we only asked for 1 key
 	}
-	return key, err
+	return key, nil
 }
 
-
+//Yes, even simple atomic reading still introduces some overhead over very fast processing, 
+// so it means less performance than without consensus tracking.
+// - but we consider that a small price for High Availability; also, we are still more performant than an actual network allows;
+// - also, there will be much less writes than reads, so the overhead will be very low but still nonzero (even uncontended atomic read 
+//   needs to sync with other caches, even though it does not wait for writes to complete and does not suffer from cache line invalidation) 
 func (p *EtcdConsensusTracker) IAmMaster() bool {
-	return p.IsMaster.Load()
+	lease := p.lease.Load()
+	if lease == nil {
+		return false
+	}
+	return time.Now().Before(lease.Expires());
 }
 
 type AlwaysMasterConsensusTracker struct {
@@ -145,6 +180,175 @@ func (p *AlwaysMasterConsensusTracker) Close() {
 func (p *AlwaysMasterConsensusTracker) IAmMaster() bool {
 	return true
 }
+
+func waitForKeyDeletion(cli *etcd.Client, offendingKey *mvccpb.KeyValue, parentCtx context.Context) {
+	//TODO use WithRequireLeader maybe?
+	ctx, cancel := context.WithCancel(parentCtx)
+	defer cancel()
+	for batch := range cli.Watch(ctx, string(offendingKey.Key),
+		etcd.WithFilterPut() /* skip all PUTs, because we only want DELETEs */,
+		etcd.WithRev(offendingKey.CreateRevision)) {
+			for _, event := range batch.Events {
+				//We asked to skip all PUTs, but generally speaking it's not the same as asking only for DELETEs;
+				// currently there are no third option, but API can change - so let's not depend on it and re-check
+				if event.Type != mvccpb.Event_DELETE {
+					continue
+				}
+
+				//OK we received a DELETE, that's all we needed to know. If that particular claim on the key has ended, we will retry putting our claim on it.
+				// (doesn't matter if someone else already grabbed the key again, we will still try, it won't hurt)
+				// Similarly, there might be even more DELETE events waiting ahead in the event stream, if a key has been
+				// recreated again while we waited. Unlikely, of course. Again, it does not matter, we will still retry capturing the key.
+				// It also means we should not expect this to definitely be the end of the stream.
+				
+				//So now we just need to stop listening and continue the outer loop, but we should not just break this loop:
+				// the manual asks us to immediately read everying that appears from the channel. 
+				// So, we ask ectd to stop notifications, then we keep reading in case some more buffered events will appear.
+				// Ultimately the channel will be closed from the other side and the loop will stop.
+				cancel() //Ask to stop notifications (does not cancel parentCtx of course)
+			}
+		}
+}
+
+//Attempts to create an ownership-guarding key; if successful, keep extending its lease as long as possible.
+//- If fails to create a key specifically because of someone holding it, returns immediately, 
+//  returning the non-nil metadata of offending key at the moment of attempt, and nil error
+//- If succeeded, does not return until 1) fails to keep the lease alive, or 2) fatal ectd failure happens, or 3) context is cancelled.
+//  then that happens, returns nil.
+//- And as usual, if fails for some other reason, returns err != nil
+//This function expects safe publication of receiver, although is supposed to be called on other gorounites
+func (p *EtcdConsensusTracker) tryCaptureAndHold(cli *etcd.Client, keyname string, ctx context.Context) (*mvccpb.KeyValue, error) {
+	lease, err := acquireLease(cli)
+	if err != nil {
+		return nil, fmt.Errorf("Cannot acquire a lease: %w", err)
+	}
+	//Normally when the current function returns it's because the lease is expired anyway, but there are cases when it's not:
+	// - panic
+	// - persistent ectd error
+	// - graceful shutdown
+	//Therefore, not to make others wait until its expiration despite us NOT servicing, we make sure we release the lease
+	defer func() {
+		_, err := cli.Lease.Revoke(context.Background(), lease.ID)
+		if err != nil {
+			if err == rpctypes.ErrLeaseNotFound {
+				//Lease has actually expired, do nothing
+			} else {
+				slog.Error("Could not renounce the lease, it might still be locking other instances out!", "Error", err, "Lease", lease.ID)
+			}
+		}
+	}()
+
+	offendingKey, err := createKey(cli, keyname, lease)
+	if err != nil {
+		return nil, fmt.Errorf("Key creation failed: %w", err)
+	}
+	if offendingKey != nil {
+		return offendingKey, nil
+	}
+
+	slog.Info("Ownership acquired")
+	
+	//Initial lease is also published by this call
+	updates := keepLeaseAlive(ctx, cli, lease)
+	for newLease := range updates {
+		slog.Info("Extended lease", "Lease", newLease)
+		p.lease.Store(&newLease)
+	}
+
+	slog.Info("Ownership lost")
+	return nil, nil
+}
+
+//Publish all updates to channel; initial lease is also published.
+//
+//Unfortunately it seems we cannot afford to just use the recommended client's KeepAlive() loop.
+// With the loop we know about each lease extension only postfactum, so it's not possible to say
+// "I requested extension at XX -> the lease extends sometime before XX + new_TTL" like we do when first requesting a lease.
+//
+//TODO Кстати может быть стоит предложить PR который добавит в стандартный loop возможность отследить время начала запроса?
+//     Это ведь несложно.
+func keepLeaseAlive(ctx context.Context, cli *etcd.Client, lease Lease) <-chan Lease {
+	channel := make(chan Lease, 1) // Try to be nonblocking
+
+	go func(c chan<- Lease) {
+		defer close(channel)
+
+		//TODO Configurable
+		attemptTimeout := time.Duration(100) * time.Millisecond
+		minStep := time.Duration(500) * time.Millisecond // Same as in recommended KeepAlive loop
+
+		//Set up initial invariant
+		var newLease Lease = lease
+		var err error
+		var nextAttempt time.Time
+		var step time.Duration
+		for { //Loop invariant: on entry to each iteration we have results of the last attempt of keepalive
+			if err == nil {
+				lease = newLease
+				nextAttempt = lease.Requested
+				step = max((lease.TTL - attemptTimeout) / 3, minStep)
+				c <- lease
+			} else {
+				if err == context.Canceled {
+					//treat it as transient error (even if it's not): do not update the cached lease but do not break the loop
+				} else {
+					break
+				}
+			}
+
+			nextAttempt = nextAttempt.Add(step)
+			if nextAttempt.After(lease.Expires()) {
+				break
+			}
+			if !waitUntil(ctx, nextAttempt) {
+				break // failed to wait because context was cancelled
+			}
+			newLease, err = keepAliveAttempt(cli, lease)
+		}
+	}(channel)
+
+	return channel
+}
+
+func waitUntil(ctx context.Context, then time.Time) bool {
+	timer := time.NewTimer(time.Until(then))
+	defer timer.Stop()
+	select {
+	case <- ctx.Done():
+		return false
+	case <- timer.C:
+		return true
+	}
+}
+
+//Attempts to invoke keep-alive for given lease within a small limited time-window.
+//If err != nil, returns the same lease
+//Returns context.Canceled as error if failed to succeed within permitted time window.
+// It does not accept context as input, therefore that's the only case when it returns that error.
+func keepAliveAttempt(cli *etcd.Client, lease Lease) (Lease, error) {
+	// Set up new time-limited context with some little timeout - large enough to perform 1 or maybe more attempts,
+	//  still little enough compared to lease TTLs (because that limit will be effectively substracted from TTL of extended lease
+	//  when guesssing its expiration time)
+	//Note: I opted for not respecting any cancellation attempts that may be coming from higher level context,
+	// because I mean this timeout to be relatively small (like 100ms), no hurt in spending 100 more ms before cancelling
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(100) * time.Millisecond)
+	defer cancel()
+	
+	now := time.Now()
+	//Note: this func may actually make multiple attempts (on transient errors)
+	resp, err := cli.KeepAliveOnce(ctx, lease.ID)
+	if err != nil {
+		return lease, err
+	}
+	return Lease { 
+		ID: lease.ID,
+		Requested: now,
+		TTL: time.Duration(resp.TTL) * time.Second,
+	}, nil
+}
+
+//TODO Конвенция говорит что если метод завершается из-за отмены контекста, он возвращает context.Canceled (если вообще возвращает error)
+// - в моих методах следует это поддержать
 
 // ETCD_UNSUPPORTED_ARCH="arm64" /opt/homebrew/opt/etcd/bin/etcd
 
@@ -193,86 +397,3 @@ func (p *AlwaysMasterConsensusTracker) IAmMaster() bool {
 //
 //		Finally AI proposed a solution which is likely widely used, which uses STOP of keepalive loop as a trigger for doing
 //		claim loop, and vice versa :) Which eliminates most races. That is the one I ended up implementing.
-
-func waitForKeyDeletion(cli *etcd.Client, offendingKey *mvccpb.KeyValue, parentCtx context.Context) {
-	//TODO use WithRequireLeader maybe?
-	ctx, cancel := context.WithCancel(parentCtx)
-	defer cancel()
-	for batch := range cli.Watch(ctx, string(offendingKey.Key),
-		etcd.WithFilterPut() /* skip all PUTs, because we only want DELETEs */,
-		etcd.WithRev(offendingKey.CreateRevision)) {
-			for _, event := range batch.Events {
-				//We asked to skip all PUTs, but generally speaking it's not the same as asking only for DELETEs;
-				// currently there are no third option, but API can change - so let's not depend on it and re-check
-				if event.Type != mvccpb.Event_DELETE {
-					continue
-				}
-
-				//OK we received a DELETE, that's all we needed to know. If that particular claim on the key has ended, we will retry putting our claim on it.
-				// (doesn't matter if someone else already grabbed the key again, we will still try, it won't hurt)
-				// Similarly, there might be even more DELETE events waiting ahead in the event stream, if a key has been
-				// recreated again while we waited. Unlikely, of course. Again, it does not matter, we will still retry capturing the key.
-				// It also means we should not expect this to definitely be the end of the stream.
-				
-				//So now we just need to stop listening and continue the outer loop, but we should not just break this loop:
-				// the manual asks us to immediately read everying that appears from the channel. 
-				// So, we ask ectd to stop notifications, then we keep reading in case some more buffered events will appear.
-				// Ultimately the channel will be closed from the other side and the loop will stop.
-				cancel() //Ask to stop notifications (does not cancel parentCtx of course)
-			}
-		}
-}
-
-//Attempts to create an ownership-guarding key; if successful, keep extending its lease as long as possible.
-//- If fails to create a key specifically because of someone holding it, returns immediately, 
-//  returning the non-nil metadata of offending key at the moment of attempt.
-//- If succeeded, does not return until 1) fails to keep the lease alive, or 2) fatal ectd failure happens, or 3) context is cancelled.
-//  then that happens, returns nil.
-//- And as usual, if fails for some other reason, returns err != nil
-func captureKeyAndKeepSupporting(cli *etcd.Client, keyname string, ctx context.Context) (*mvccpb.KeyValue, error) {
-	lease, err := acquireLease(cli)
-	if err == nil {
-		slog.Info("Lease", "response", fmt.Sprintf("%#v", lease))
-	} else {
-		//????
-	}
-	//Normally when the current function returns it's because the lease is expired anyway, but there are cases when it's not:
-	// - panic
-	// - persistent ectd error
-	// - graceful shutdown
-	//Therefore, not to make others wait until its expiration despite us NOT servicing, we make sure we release the lease
-	defer func() {
-		_, err := cli.Lease.Revoke(context.Background(), lease.ID)
-		if err != nil {
-			if err == rpctypes.ErrLeaseNotFound {
-				//Lease has actually expired, do nothing
-			} else {
-				slog.Error("Could not renounce the lease, it might still be locking other instances out!", "Error", err, "Lease", lease.ID)
-			}
-		}
-	}()
-
-	offendingKey, err := createKey(cli, keyname, lease)
-	if err != nil {
-		//TODO ???
-		return nil, err //or maybe wrap it
-	}
-	if offendingKey != nil {
-		return offendingKey, nil
-	}
-	
-	updates, err := cli.Lease.KeepAlive(ctx, lease.ID)
-	if err != nil {
-		//????
-		return nil, err //or maybe wrap it
-	}
-
-	//TODO А потом вообще переделать и в main на то чтобы не вызывать всем Shutdown а отменять контекст
-	// - но это подходит только тем кто умеет его слушать (надо проверять)
-	for upd := range updates {
-		//TODO update cached lease
-		slog.Info("TTL updated", "TTL", upd.TTL)
-	}
-
-	return nil, nil
-}
