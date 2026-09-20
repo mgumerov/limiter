@@ -51,7 +51,8 @@ func CreateTestServer(processor server.Processor, serverFailed chan<- struct{}, 
 	}
 
 	go func() {
-		time.Sleep(time.Duration(3) * time.Second) //Do not start at once, because of slow ectd handshake
+		//Do not start at once, because it takes some time for consesus tracker to fully start up
+		time.Sleep(time.Duration(1) * time.Second) 
 
 		if err := f1.New().Add("tests", setupTest).ExecuteWithArgs(os.Args[1:]); err != nil {
 			slog.Error("Unable to start F1 tests", "error", err)
