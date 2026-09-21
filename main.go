@@ -42,10 +42,6 @@ func main() {
 		os.Exit(1) //TODO
 	}
 
-	//TODO we might want to test if thread-safety measures taken by victoriametrics are causing too much overhead because
-	// otherwise we process each request very fast and that overhead might be noticeable. In that case we'll need to maybe
-	// collect only each Nth request into histograms (but that would make it blind to most peaks); as for totals, we can 
-	// accumulate time via some cheaper means and periodically dump it to metrics.
 	var myMetrics = metrics.NewSet()
 
 	nctx, stop := signal.NotifyContext(
