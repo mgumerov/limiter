@@ -361,6 +361,7 @@ func keepLeaseAlive(ctx context.Context, cli *etcd.Client, lease Lease) <-chan L
 		var err error
 		var nextAttempt time.Time
 		var step time.Duration
+		loop:
 		for { //Loop invariant: on entry to each iteration we have results of the last attempt of keepalive
 			if err == nil {
 				lease = newLease
@@ -371,7 +372,7 @@ func keepLeaseAlive(ctx context.Context, cli *etcd.Client, lease Lease) <-chan L
 				case c <- lease:
 					//Try publishing the lease. But, if receiving side is gone (say, panicked), this will hang when the buffer is overrun...
 				case <- ctx.Done():
-					break //... that's why we also watch for cancellation. If the receiving side stops, we expect it to at least notify us.
+					break loop //... that's why we also watch for cancellation. If the receiving side stops, we expect it to at least notify us.
 				}
 				
 			} else { 
