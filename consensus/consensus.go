@@ -86,6 +86,9 @@ func StartMasterLeaseLoop(ctx context.Context, failed chan struct{}, cfg *server
 			backoff := false
 
 			//TODO use WithRequireLeader context maybe?
+			//This creates a goroutine. Should I care about whether it stops correctly if current function panics?
+			// I think not. Because the current function does not interfact with that goroutine, - tryCaptureAndHold does,
+			// and it creates it, hence it's completely its concern. Same goes for waitForKeyDeletion.
 			offendingKey, err := tracker.tryCaptureAndHold(ctx, cli, cfg.ETCDkey)
 			if err != nil {
 				slog.Error("Etcd key capture failed", "Error", err)
@@ -212,9 +215,14 @@ func (p *AlwaysMasterConsensusTracker) IAmMaster() bool {
 func waitForKeyDeletion(parentCtx context.Context, cli *etcd.Client, offendingKey *mvccpb.KeyValue) error {
 	//TODO use WithRequireLeader maybe?
 	ctx, cancel := context.WithCancel(parentCtx)
-	defer cancel()
+	defer cancel() // Watch API says we must cancel its context when not needed anymore
 	err := error(nil)
-	for batch := range cli.Watch(ctx, string(offendingKey.Key),
+	//If we are interrupted, Watch eventually stops and we return;
+	// if however we panic after setting up watch, and stop listening, the watch goroutine might hang in sending us updates.
+	// Thankfully, we already scheduled context cancellation right above, meaning in case of panic we cancel the context
+	// and Watch unblocks. Watch API does not say this will work even if we don't read the channel anymore, but it does not say
+	// otherwise, and they are pretty specific: if context stops, the channel closes.
+ 	for batch := range cli.Watch(ctx, string(offendingKey.Key),
 		etcd.WithFilterPut() /* skip all PUTs, because we only want DELETEs */,
 		etcd.WithRev(offendingKey.CreateRevision)) {
 			if batch.Canceled { //In case of an error (NOT of context cancellation, mind you!)
@@ -251,6 +259,12 @@ func waitForKeyDeletion(parentCtx context.Context, cli *etcd.Client, offendingKe
 //- If succeeded at creating a key, does not return until 1) fails to keep the lease alive, 
 //  or 2) fatal ectd failure happens, or 3) context is cancelled; then one of these happens, returns nil, and nil error.
 //This function expects safe publication of receiver, although is supposed to be called on other gorounites
+//
+//NOTE: all funcs might panic midflight. Meaning they can finish their execution (and run defers) not just at return points
+// (which we expect when write them) but at any point whatsoever (which we normally don't).
+// Unfortunately it means that all functions need to be checked - every lone of them - for "what happens if we panic here"
+// specifially in terms of how other parts of program might depend on us: maybe they expect that we tell them to stop,
+// maybe they expect us to read something we publish, maybe they expect we can still use some resource that we set up a defer to kill.
 func (p *EtcdConsensusTracker) tryCaptureAndHold(pctx context.Context, cli *etcd.Client, keyname string) (*mvccpb.KeyValue, error) {
 	ctx, cancel := context.WithTimeout(pctx, ETCD_TIMEOUT)
 	defer cancel()
@@ -271,7 +285,6 @@ func (p *EtcdConsensusTracker) tryCaptureAndHold(pctx context.Context, cli *etcd
 	//Therefore, not to make others wait until its expiration despite us NOT servicing, we make sure we release the lease
 	// (in case key has been created, it will delete it)
 	defer func() {
-//TODO check if works correctly if keepalive is still running at the time.
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
 		_, err := cli.Lease.Revoke(cleanupCtx, lease.ID) 
@@ -284,7 +297,7 @@ func (p *EtcdConsensusTracker) tryCaptureAndHold(pctx context.Context, cli *etcd
 		}
 	}()
 
-	ctx, cancel = context.WithTimeout(pctx, ETCD_TIMEOUT) //Ignore parent context because we set a specific short time limit
+	ctx, cancel = context.WithTimeout(pctx, ETCD_TIMEOUT)
 	defer cancel()
 
 	offendingKey, err := createKey(ctx, cli, keyname, lease)
@@ -296,9 +309,23 @@ func (p *EtcdConsensusTracker) tryCaptureAndHold(pctx context.Context, cli *etcd
 	}
 
 	slog.Info("Ownership acquired")
+
+	//Regarding checking whether panicking at every line is properly handled.
+	// This function is mostly OK to panic anywhere, but there is a weak spot right here,
+	// after keepalive func spawns a goroutine. If panics after that, or the updates-listening loop panics,
+	// what happens then?
+	// The goroutine itself is not eternal, it would stop on shutdown.
+	// Also, it would naturally stop because of failure when the already scheduled defer killed the lease.
+	// But it publishes updates via channel, so if the receiving side (this func) disappears, 
+	// the goroutine might hang - before it sees a shutdown or lease continuation error.
+	// That's a problem. In this case we solve it from goroutine's side by select{} between sending and context cancellation,
+	// which AI says is an idiomaic way to do it. And from our side we solve it by sending cancellation
+	// if panic happens.
+	ctx, cancel = context.WithCancel(pctx)
+	defer cancel() // we use it to stop the keep-alive goroutine in case we panic before it completes
 	
 	//Initial lease is also published by this call
-	updates := keepLeaseAlive(pctx, cli, lease)
+	updates := keepLeaseAlive(ctx, cli, lease)
 	for newLease := range updates {
 	 	slog.Info("Extended lease", "Lease", newLease)
 	 	p.lease.Store(&newLease)
@@ -314,6 +341,7 @@ func (p *EtcdConsensusTracker) tryCaptureAndHold(pctx context.Context, cli *etcd
 // we got a network error instead of etcd response, or ctx timed out);
 // in that latter case it does not try to remove the lease or do anything else to recover from that indeterminate state,
 // that's caller's responsibity if desired.
+//If the context stops, the channel is closed and the keepalive loop stops.
 //
 //Unfortunately it seems we cannot afford to just use the recommended client's KeepAlive() loop.
 // With the loop we know about each lease extension only postfactum, so it's not possible to say
@@ -338,7 +366,14 @@ func keepLeaseAlive(ctx context.Context, cli *etcd.Client, lease Lease) <-chan L
 				lease = newLease
 				nextAttempt = lease.Requested
 				step = max((lease.TTL - KEEP_ALIVE_ATTEMPT_TIMEOUT) / 3, minStep)
-				c <- lease
+
+				select {
+				case c <- lease:
+					//Try publishing the lease. But, if receiving side is gone (say, panicked), this will hang when the buffer is overrun...
+				case <- ctx.Done():
+					break //... that's why we also watch for cancellation. If the receiving side stops, we expect it to at least notify us.
+				}
+				
 			} else { 
 				//Keep in mind that some errs (say, connection-dropped) do not mean we could not actually succeed without knowing it,
 				// so we should be ready for that outcome.	
