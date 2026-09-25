@@ -229,7 +229,7 @@ func startPrometheusPublisher(failed chan<- struct{}, port string, metrics *metr
 		}
 
 		go func() {
-			if err := prom.httpServer.ListenAndServe(); err != nil  {
+			if err := prom.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed  {
 				slog.Error("Failed to set up metrics http server", "Error", err)
 				failed <- struct{}{}
 			}
