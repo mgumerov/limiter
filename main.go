@@ -9,9 +9,12 @@ import (
 	"os/signal"
 	"strconv"
 	"syscall"
+	"time"
 
 	"github.com/VictoriaMetrics/metrics"
 	"gopkg.in/yaml.v3"
+
+	"net/http" //for promhttp only
 
 	"limiter/casproc"
 	"limiter/consensus"
@@ -42,8 +45,8 @@ func main() {
 		os.Exit(1) //TODO
 	}
 
-	var myMetrics = metrics.NewSet()
-
+	var myMetrics = metrics.NewSet() //+ metrics.RegisterSet(...) if we need to also serve normal metrics. 
+	
 	nctx, stop := signal.NotifyContext(
 		context.Background(),
 		os.Interrupt,
@@ -54,6 +57,19 @@ func main() {
 	//Create nested context so that we could cancel it even when shutdown is not initiated by a signal
 	ctx, cancel  := context.WithCancel(nctx)
 	defer cancel()
+
+
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8000"
+	}
+	mport := os.Getenv("MPORT")
+	if mport == "" {
+		mport = "8001"
+	}
+
+	promFailed := make(chan struct{}, 1)
+	prom := startPrometheusPublisher(promFailed, mport, myMetrics)
 		
 	trackerFailed := make(chan struct{}, 1)
 	tracker := consensus.StartMasterLeaseLoop(ctx, trackerFailed, cfg)
@@ -91,7 +107,7 @@ func main() {
 	serverFailed := make(chan struct{}, 1)
 	var server server.Server
 	switch v := os.Getenv("S"); v {
-	case "F": server = fiberserver.CreateFiberServer(processor, serverFailed, cfg, myMetrics)
+	case "F": server = fiberserver.CreateFiberServer(processor, serverFailed, port, myMetrics)
 	case "T": server = testserver.CreateTestServer(processor, serverFailed, cfg, myMetrics)
 	default:
 		slog.Error("Invalid request server specified in env", "S", v)
@@ -111,6 +127,9 @@ func main() {
 	case <- trackerFailed:
 		slog.Error("Consensus-tracking engine failed")
 		tracker = nil
+	case <- promFailed:
+		slog.Error("Prometheus endpoint failed")
+		prom = nil
 	}
 
 	var buf bytes.Buffer
@@ -131,7 +150,9 @@ func main() {
 	if processor != nil {
 		processor.Close()
 	}
-
+	if prom != nil {
+		prom.Shutdown()
+	}
 }
 
 func LoadConfig(path string) (*server.Config, error) {
@@ -148,9 +169,6 @@ func LoadConfig(path string) (*server.Config, error) {
 	//This is better be decoupled from reading because we could load config from different sources. For now, we don't.
 	if cfg.MaxRequest == 0 {
 		return nil, fmt.Errorf("Maximum request size is not defined")
-	}
-	if cfg.Port == 0 {
-		return nil, fmt.Errorf("Port is not defined")
 	}
 
 	return &cfg, nil
@@ -190,4 +208,50 @@ func (p *GuardedProcessor) Request(key string, amount int32) server.Response {
 
 func (p *GuardedProcessor) Close() {
 	p.next.Close()
+}
+
+func startPrometheusPublisher(failed chan<- struct{}, port string, metrics *metrics.Set) *Prom {
+	prom := &Prom { httpServer: nil }
+	if port != "0" {
+		mux := http.NewServeMux()
+
+		mux.Handle("/metrics", http.HandlerFunc(func (w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/metrics":
+				metrics.WritePrometheus(w)
+			}
+		}))
+
+		slog.Info("Starting Prometheus endpoint server (use MPORT=0 to disable endpoint)", "Port", port)
+		prom.httpServer = &http.Server{
+			Addr: ":" + port,
+			Handler: mux,
+		}
+
+		go func() {
+			if err := prom.httpServer.ListenAndServe(); err != nil  {
+				slog.Error("Failed to set up metrics http server", "Error", err)
+				failed <- struct{}{}
+			}
+		}()
+	} else {
+		slog.Warn("Running without Prometheus endpoint")
+	}
+
+	return prom
+}
+
+type Prom struct {
+	httpServer *http.Server
+}
+
+func (p *Prom) Shutdown() {
+	if p.httpServer == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(3) * time.Second)
+	defer cancel()
+	if err := p.httpServer.Shutdown(ctx); err != nil {
+		slog.Error("Error while shutting down metrics endpoint", "Error", err)
+	}
 }

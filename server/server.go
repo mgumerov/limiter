@@ -33,10 +33,9 @@ type Server interface {
 }
 
 type Config struct {
-	Port       int              `yaml:"port"`
 	MaxRequest int32            `yaml:"max_requests"`
 	APIs       map[string]int32 `yaml:"api"`
-	ETCD	   etcd.Config     `yaml:"etcd"`
+	ETCD	   etcd.Config      `yaml:"etcd"`
 	ETCDkey	   string			`yaml:"etcd-key"`
 }
 

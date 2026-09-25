@@ -17,13 +17,13 @@ import (
 
 var _ server.Server = (*fiber.App)(nil) //fail-fast type guard
 
-func CreateFiberServer(processor server.Processor, fiberFailed chan<- struct{}, cfg *server.Config, myMetrics *metrics.Set) server.Server {
+func CreateFiberServer(processor server.Processor, fiberFailed chan<- struct{}, port string, myMetrics *metrics.Set) server.Server {
 	fiber := createHTTP(processor, fiberFailed, myMetrics)
 	//This creates (or eventually creates) Fiber's goroutines that will then execute our functions which in turn access Config
 	// and Processor's state. Because starting a goroutine is sequenced-after any code leading to it, and serialized-before the goroutine's
 	// code, the goroutine will observe everything this method currently observes (in terms of concurrency). 
 	// Meaning, processor is safely published to that goroutine as its contract requires.
-	startHTTP(fiber, fiberFailed, cfg)
+	startHTTP(fiber, fiberFailed, port)
 	return fiber
 }
 
@@ -84,7 +84,7 @@ func createHTTP(processor server.Processor, fiberFailed chan<- struct{}, myMetri
 	return app
 }
 
-func startHTTP(http *fiber.App, fiberFailed chan<- struct{}, cfg *server.Config) {
+func startHTTP(http *fiber.App, fiberFailed chan<- struct{}, port string) {
 	go func() {
 		defer func() { //always report termination
 			//We still want to attempt a controlled termination in main routine, not just crash the app right here
@@ -93,10 +93,12 @@ func startHTTP(http *fiber.App, fiberFailed chan<- struct{}, cfg *server.Config)
 				fiberFailed <- struct{}{}
         	}
 		} ()
-			
+
+		slog.Info("Starting Fiber server (use PORT to change listening port)", "Port", port)
+	
 		//startup errors return non-nil, graceful shutdown returns nil, shutdown errors are only returned via shutdown() - not here
 		//TODO now we can switch this to detectint cancellation via passed context, Fiber had a config option for that
-		if err := http.Listen(fmt.Sprintf(":%d", cfg.Port)); err != nil {
+		if err := http.Listen(":" + port); err != nil {
 			slog.Error("HTTP server startup failed", "error", err)
 			fiberFailed <- struct{}{}
 		}
