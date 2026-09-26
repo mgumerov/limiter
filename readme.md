@@ -1,10 +1,31 @@
-Next steps:
-- Finally go HA: allow launching multiple standby instances and use Zookeeper to track leadership,
-  my current idea is short term lease with prolongation as long as the server lives
-- Use thunderbolt to link my two Mac machines to get big enough load to see Fiber's limits
+# Research project: Centralized Rate-Limiter
+
+## Motivation
+
+I was going to study advanced aspects of Go in a little Senior level project. One of AI's proposal was a rate limiter like the build-in one, but I judged that an internal rate limiter is a very narrow task and hence offers little in terms of gaining/showing proficiency in different areas. So I went for external, centralized rate limiter, the way some use Redis for example.
+
+The code might be a little hard to read because it is unusually densely commented: in this project I tend to document most of reasons/decisions in comments.
+
+## Features / Goals
+
+- This limiter is supposed to be used as outgoing rate limiter, not incoming rate limiter, which reflects on some decisions made,
+like whether to allow exceeding of a limit, or how malicious our clients might be, etc.
+- The client calls the limited to request a token, a success means that the caller can make a request to a target API; a failure means the request is rejected, most probably because the request to target API would exceed the RPS limit
+- The caller can request multiple tokens at once, but I did not yet consider noisy-neighbour fairness implications in this case
+- It sets a dedicated limit for each of unique API keys, and every request for tokens specifies an API key
+- It prioritizes limiting guarantees over throughput: for example, if no tokens were requested for a second, it does not mean a client can request twice the RPS limit the next second, even it means that means overall RPS over time will be less than the limit.
+- It currently uses one bucket-based algorithm but in three flavours: by-the-book one, with requests to same API key serialized by using  channels and a worker goroutine (more go-like supposedly), or by using Mutex (better performance); and custom one, of my design, which does not require serialization and relies on CAS operations instead. The algorithm can be picked via env vars; other options are taken from config.yaml
+- It does not try to be scalable through adding extra instances (well, of course it still can be sharded by API keys, but barring that - one API key cannot be served by multiple instances simultaneously)
+- Instead, it tries to provide extremely high performance with just single instance; my latest measurements say 5M+ RPS beyond the HTTP server boundary. Sadly, at the time I do not have the proper hardware to test end-to-end performance (including network overhead + HTTP server), I did observe 120K+ RPS in the cloud but I will probably see much more on good machines connected by fast LAN.
+- It currently accepts HTTP requests using Fiber server because of its proven high performance. I am also planning to add serving GRPC as an option, to see if multiplexing via less connections will also provide comparable performance.
+- It can still use multiple instances - not for scalability but for availability. When used this way, it uses etcd to make sure at most one instance can serve requests at any time, even in case of network partitioning.
+- It publishes some Prometheus metrics to allow observing its statistics; however it cannot publish too much details because gathering them would introduce extra contention and damage the performance.
+
+## Next steps:
+- Use fast LAN and two good machines to get big enough load to see Fiber's limits
 - Then write gRPC server (using standard Google's grpc implemenation for Go) and see how good it performs compared to Fiber
 
-Log of testing (in Russian):
+# Log of testing (in Russian):
 
 1. Cloud based
 
@@ -13,7 +34,7 @@ Log of testing (in Russian):
 //sudo mv hey_linux_amd64 /usr/local/bin/hey
 //hey -n 100000 -c 2 -m POST "http://localhost:3000/api1"
 
-// Первые тесты делал без полезной нагрузки - просто возращал ОК.
+// Первые тесты делал без полезной нагрузки - просто возвращал ОК.
 
 // Деградацию правильно мерить не по тому что длительность теста не меняется
 // ведь клиенты не обязательно ложатся в гэпы друг друга если только перекрытие не многократное
