@@ -19,6 +19,7 @@ import (
 	"limiter/casproc"
 	"limiter/consensus"
 	"limiter/fiberserver"
+	"limiter/grpcserver"
 	"limiter/mutexproc"
 	"limiter/server"
 	"limiter/testserver"
@@ -108,6 +109,7 @@ func main() {
 	var server server.Server
 	switch v := os.Getenv("S"); v {
 	case "F": server = fiberserver.CreateFiberServer(processor, serverFailed, port, myMetrics)
+	case "G": server = grpcserver.CreateGRPCServer(processor, serverFailed, port, myMetrics)
 	case "T": server = testserver.CreateTestServer(processor, serverFailed, cfg, myMetrics)
 	default:
 		slog.Error("Invalid request server specified in env", "S", v)

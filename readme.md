@@ -2,7 +2,7 @@
 
 ## Motivation
 
-I was going to study advanced aspects of Go in a little Senior level project. One of AI's proposal was a rate limiter like the build-in one, but I judged that an internal rate limiter is a very narrow task and hence offers little in terms of gaining/showing proficiency in different areas. So I went for external, centralized rate limiter, the way some use Redis for example.
+I was going to study advanced aspects of Go in a little Senior level project. One of AI's proposal was a rate limiter like the built-in one, but I judged that an internal rate limiter is a very narrow task and hence offers little in terms of gaining/showing proficiency in different areas. So I went for external, centralized rate limiter, the way some use Redis for example.
 
 The code might be a little hard to read because it is unusually densely commented: in this project I tend to document most of reasons/decisions in comments.
 
@@ -10,6 +10,8 @@ The code might be a little hard to read because it is unusually densely commente
 
 - This limiter is supposed to be used as outgoing rate limiter, not incoming rate limiter, which reflects on some decisions made,
 like whether to allow exceeding of a limit, or how malicious our clients might be, etc.
+  - This also affects the expected profile of connections. In incoming requests we would more likely see lots of clients with just one or a few connections, whereas an outbound limiter will see not so many clients but lots of connections (for HTTP 1; obviously for HTTP/2 it will be different)
+
 - The client calls the limited to request a token, a success means that the caller can make a request to a target API; a failure means the request is rejected, most probably because the request to target API would exceed the RPS limit
 - The caller can request multiple tokens at once, but I did not yet consider noisy-neighbour fairness implications in this case
 - It sets a dedicated limit for each of unique API keys, and every request for tokens specifies an API key
@@ -20,10 +22,10 @@ like whether to allow exceeding of a limit, or how malicious our clients might b
 - It currently accepts HTTP requests using Fiber server because of its proven high performance. I am also planning to add serving GRPC as an option, to see if multiplexing via less connections will also provide comparable performance.
 - It can still use multiple instances - not for scalability but for availability. When used this way, it uses etcd to make sure at most one instance can serve requests at any time, even in case of network partitioning.
 - It publishes some Prometheus metrics to allow observing its statistics; however it cannot publish too much details because gathering them would introduce extra contention and damage the performance.
+- Also carries gRPC server as an option
 
 ## Next steps:
 - Use fast LAN and two good machines to get big enough load to see Fiber's limits
-- Then write gRPC server (using standard Google's grpc implemenation for Go) and see how good it performs compared to Fiber
 
 # Log of testing (in Russian):
 
@@ -293,6 +295,16 @@ like whether to allow exceeding of a limit, or how malicious our clients might b
 // Аналогично видим что при отключении etcd инстанс дорабатывает аренду и затем перестает выдавать. Дальше через минуту
 // пытается снова найти etcd, на сей раз повезло второму инстансу и он перехватил лидерство.
 
-4. LAN based tests
+4. GRPC tests
+
+In all three worker modes (even in non-blocking CAS mode) the throughput seem to cap at 50k RPS. I used the same 20 vCPU client and 20 vCPU server as with Fiber+hey, but this time with GRPC+ghz, in the same cloud. Actually, I hesitate to make conclusions that this is the limit of GRPC performance, because in Fiber tests I suspected the cloud-supplied network to be the bottleneck, and believed the real productivity to be much higher. But here the results are 2x worse than in those tests, so I cannot blame the network now. Yet 50k RPS is somewhere on lower side of results observed in different tests with lightweight payloads, I've been expecting to see maybe 100k or 150k.
+
+Let's postpone any conclusions for now - to a moment when I conduct LAN based tests.
+
+I however wasn't really expecting http/2 to be faster than http in general, it's just I expected good performance from the default implementation because there are claims that it is fast.
+
+5. LAN based tests
 
 ...coming as soon as I buy Thunderbolt cable
+
+// /opt/homebrew/opt/etcd/bin/etcd

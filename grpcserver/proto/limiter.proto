@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package limiter;
+
+option go_package = "limiter/proto";
+
+service Limiter {
+  rpc Request(RequestRequest) returns (RequestResponse);
+}
+
+message RequestRequest {
+  string key = 1;
+  int32 amount = 2;
+}
+
+message RequestResponse {
+  int32 granted = 1;
+}
