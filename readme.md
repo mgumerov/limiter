@@ -303,8 +303,43 @@ Let's postpone any conclusions for now - to a moment when I conduct LAN based te
 
 I however wasn't really expecting http/2 to be faster than http in general, it's just I expected good performance from the default implementation because there are claims that it is fast.
 
-5. LAN based tests
+5. PProf investigation (Fiber, local machine)
+
+Local tests with P=C R=3 are giving me up to 100K rps on my M1 8-cpu MacBook Air, using only 200% of a core.
+P=W => 80k, P=M => 90K
+
+I was curious of exactly how Fiber spends all the time, because we already established the limiter can process 5M+ RPS if http interaction is excluded from measurements.
+
+Let's start with P=C.
+As I discovered, the Go profiler in the RTL gathers blocked time and CPU time separately.
+**CPU times** were like this: workerFunc (reads, parses, handles request and sends a response) = 69.3%, net.(\*conn).Read (reads request) = 29.3%, net.(\*conn).Write = 38.5%, that only leaves 1.5% inside workerFunc unaccounted for. Basically, unless I find out how to dramatically reduce costs of Read and Write, it does not make sense to look for other reasons of slowness. On the other hand 30% more samples are gathered somewhere else; actually 10% is netpoll+kevent, but 10% is 
+somewhere around mPark, which seems very weird / something to investigate as TODO, because no way the application is too often left without work with 100K requests coming each second. Or can it? If requests are really processed very quickly, it could be - but then we could have been able to serve 200K instead, which we cannot. On the other hand we don't know why we cannot, because this is only a local test, maybe just it's my client is not fast enough to keep up. Another reason could be high lock contention, like, we have 100k running goroutines but all of them are waiting for something, so no other work available for the machine. If so, that would be reflected in Blocks profile, that we will look into shortly. But ultimately, that's something to look up later, but anyway even stripping away 10% of CPU time will not significantly speed us up.
+
+Another question is, how can we see read and write on CPU sampling if those functions are supposed to be nonblocking for network sockets? I even took care to use netstat -an | grep 8000 | awk '\$2 > 0 || \$3 > 0' to see how many connections have something queued, and yes, a couple hundreds do. It seems weird, because why will data sit there and not get transferred into socket? The doorbell for transferring to network card is supposed to be signaled each microsecond or so. Does appearing on CPU samples and on netstat indicate they are blocking actually? Well no, blocking would not show them on CPU, but rather on Block profile; but they might be spinning rather than sleeping. Also yet, if waiting happens inside a syscall, the goroutine cannot be preemted and thus will show up on CPU samples.
+
+(Actually "list Write" says /usr/local/go/src/internal/poll/fd_unix.go calling ignoringEINTRIO(syscall.Write...) in a loop, so it's really spinning)
+
+But no, netstat shows data in sendQ for one simple reason: they are kept there until the receiving side acks, because they might be needed for retransmitting if some chunks get lost. That means they are sitting there not for merely 1 microsecond but for entire RTT, which is of course still low, but in the range of anywhere up to 0.5 ms even on localhost, thus, given sheer number of sends, to see them on any given snapshot is not so unlikely as with 1 microsecond.
+
+Yet, if read and write appears on CPU sampling because of spinning, why would they spin? Writing would, for large payloads, if it's are unable to put everything in a send-Q at once - but in our case we only send one response at a time in each connection and it's tiny; and reading would likely never spin. So, it's not because of spinning - then why if they are fast nonblocking calls? The answer is: nonblocking does not mean fast. If we consider the writing taking not 40% of 200% cores, but 80% of 1 core, then 100K calls per second only leaves 10 micros per call (8 micros, even), and it's not a lot of time for hardware interacting functions. Actually https://github.com/oven-sh/bun/issues/40930 measured write duration as about 4 micros; so it's in the same order of magnitude.
+
+So I consider the mistery solved, at least until proper LAN tests.
+And I consider writes and reads justified.
+And I consider I don't have any room for improvement here.
+
+Oh, but that analysis would be incomplete without looking for **profile of blocks**, like I promised earlier.
+93% of all time spent in block-waiting is workerFunc, that's cumulative, 82% being channel read reading from network, and 12% being serveconn (which deserializes and executes request and sends a response) - those 12% are caused by a mutex I use for collecting VictoriaMetrics, so it's not really Fiber's problem.
+Is that a problem at all? Not necessarily. 1) While a goroutine is waiting for mutex, another has its chance to be executed. Unless of course they contend for same mutex! Which is to be determined 2) Total waiting time measured was just above 1 second, 10% of it is 100ms, while test duration was 22 seconds, so it's totally negligible.
+then 82+12 is only 1% short of 93%, no sense in analysing that 1%. And 100-93=7% of waiting time I also don't deem worth looking into, it's even less than 10% I just discarded.
+
+If we look at blocking implementation P=M for comparison, even though it's unlikely that read/write behavoir (which took up most of time earlier) will be different, we see that 20% of blocks is spent waiting for mutex, but it's not that bad: again, 20% of blocked time is not the same as 20% of total test time.
+
+6. LAN based tests
 
 ...coming as soon as I buy Thunderbolt cable
 
 // /opt/homebrew/opt/etcd/bin/etcd
+
++ Провести тест с grpc (и почему медленнее?)
+
++ в резюме - pperf, и освежил знания по работе TCP

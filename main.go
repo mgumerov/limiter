@@ -9,12 +9,11 @@ import (
 	"os/signal"
 	"strconv"
 	"syscall"
-	"time"
-
+	
 	"github.com/VictoriaMetrics/metrics"
 	"gopkg.in/yaml.v3"
 
-	"net/http" //for promhttp only
+	management "limiter/mgmt"
 
 	"limiter/casproc"
 	"limiter/consensus"
@@ -69,8 +68,8 @@ func main() {
 		mport = "8001"
 	}
 
-	promFailed := make(chan struct{}, 1)
-	prom := startPrometheusPublisher(promFailed, mport, myMetrics)
+	mgmtFailed := make(chan struct{}, 1)
+	mgmt := management.StartManagementServer(mgmtFailed, mport, myMetrics)
 		
 	trackerFailed := make(chan struct{}, 1)
 	tracker := consensus.StartMasterLeaseLoop(ctx, trackerFailed, cfg)
@@ -129,9 +128,9 @@ func main() {
 	case <- trackerFailed:
 		slog.Error("Consensus-tracking engine failed")
 		tracker = nil
-	case <- promFailed:
-		slog.Error("Prometheus endpoint failed")
-		prom = nil
+	case <- mgmtFailed:
+		slog.Error("Management endpoint failed")
+		mgmt = nil
 	}
 
 	var buf bytes.Buffer
@@ -152,8 +151,8 @@ func main() {
 	if processor != nil {
 		processor.Close()
 	}
-	if prom != nil {
-		prom.Shutdown()
+	if mgmt != nil {
+		mgmt.Shutdown()
 	}
 }
 
@@ -210,50 +209,4 @@ func (p *GuardedProcessor) Request(key string, amount int32) server.Response {
 
 func (p *GuardedProcessor) Close() {
 	p.next.Close()
-}
-
-func startPrometheusPublisher(failed chan<- struct{}, port string, metrics *metrics.Set) *Prom {
-	prom := &Prom { httpServer: nil }
-	if port != "0" {
-		mux := http.NewServeMux()
-
-		mux.Handle("/metrics", http.HandlerFunc(func (w http.ResponseWriter, r *http.Request) {
-			switch r.URL.Path {
-			case "/metrics":
-				metrics.WritePrometheus(w)
-			}
-		}))
-
-		slog.Info("Starting Prometheus endpoint server (use MPORT=0 to disable endpoint)", "Port", port)
-		prom.httpServer = &http.Server{
-			Addr: ":" + port,
-			Handler: mux,
-		}
-
-		go func() {
-			if err := prom.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed  {
-				slog.Error("Failed to set up metrics http server", "Error", err)
-				failed <- struct{}{}
-			}
-		}()
-	} else {
-		slog.Warn("Running without Prometheus endpoint")
-	}
-
-	return prom
-}
-
-type Prom struct {
-	httpServer *http.Server
-}
-
-func (p *Prom) Shutdown() {
-	if p.httpServer == nil {
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(3) * time.Second)
-	defer cancel()
-	if err := p.httpServer.Shutdown(ctx); err != nil {
-		slog.Error("Error while shutting down metrics endpoint", "Error", err)
-	}
 }

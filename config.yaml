@@ -8,4 +8,4 @@ etcd:
   #  - "localhost:22379"
   #  - "localhost:32379"
   dial-timeout: 5s
-etcd-key: limiter
+#etcd-key: limiter

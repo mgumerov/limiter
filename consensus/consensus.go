@@ -347,7 +347,13 @@ func (p *EtcdConsensusTracker) tryCaptureAndHold(pctx context.Context, cli *etcd
 // With the loop we know about each lease extension only postfactum, so it's not possible to say
 // "I requested extension at XX -> the lease extends sometime before XX + new_TTL" like we do when first requesting a lease.
 //
-//TODO Propose PR to make standard KeepAlive loop know about starting time of each attempt, shouldn't be difficult.
+//I thought about proposing a PR to make standard KeepAlive loop know about starting time of each attempt,
+// but looking at their code it's not completely straightforward - not difficult, mind you, if KeepAlive just keeps track of
+// all last requests made for each lease, but such PR will still have some impact on all users of the client, that's a risk,
+// and not a justified risk: sure, having safe estimation for expiration time is great for everyone, still in general case
+// users starting some action within that TTL cannot be sure it finishes within that TTL! It means, no real benefits, because
+// behavior near end of TTL will be just as undefined as it is now. Except for projects like this one, 
+// where only starting time of action matters.
 func keepLeaseAlive(ctx context.Context, cli *etcd.Client, lease Lease) <-chan Lease {
 	channel := make(chan Lease, 1) // Try to be nonblocking
 
