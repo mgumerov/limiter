@@ -87,6 +87,7 @@ func createGRPC(
 	handlerTime := myMetrics.NewHistogram("handler_time")
 
 	grpcSrv := grpc.NewServer(
+		grpc.MaxConcurrentStreams(1000),
 		grpc.UnaryInterceptor(
 			func(
 				ctx context.Context,

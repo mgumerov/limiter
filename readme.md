@@ -13,7 +13,7 @@ like whether to allow exceeding of a limit, or how malicious our clients might b
   - This also affects the expected profile of connections. In incoming requests we would more likely see lots of clients with just one or a few connections, whereas an outbound limiter will see not so many clients but lots of connections (for HTTP 1; obviously for HTTP/2 it will be different)
 
 - The client calls the limited to request a token, a success means that the caller can make a request to a target API; a failure means the request is rejected, most probably because the request to target API would exceed the RPS limit
-- The caller can request multiple tokens at once, but I did not yet consider noisy-neighbour fairness implications in this case
+- The caller can request multiple tokens at once, but I did not yet consider noisy-neighbour fairness implications in this case. It was simply more interesting technically to find a way to serve super high RPS.
 - It sets a dedicated limit for each of unique API keys, and every request for tokens specifies an API key
 - It prioritizes limiting guarantees over throughput: for example, if no tokens were requested for a second, it does not mean a client can request twice the RPS limit the next second, even it means that means overall RPS over time will be less than the limit.
 - It currently uses one bucket-based algorithm but in three flavours: by-the-book one, with requests to same API key serialized by using  channels and a worker goroutine (more go-like supposedly), or by using Mutex (better performance); and custom one, of my design, which does not require serialization and relies on CAS operations instead. The algorithm can be picked via env vars; other options are taken from config.yaml
@@ -297,7 +297,7 @@ like whether to allow exceeding of a limit, or how malicious our clients might b
 
 4. GRPC tests
 
-In all three worker modes (even in non-blocking CAS mode) the throughput seem to cap at 50k RPS. I used the same 20 vCPU client and 20 vCPU server as with Fiber+hey, but this time with GRPC+ghz, in the same cloud. Actually, I hesitate to make conclusions that this is the limit of GRPC performance, because in Fiber tests I suspected the cloud-supplied network to be the bottleneck, and believed the real productivity to be much higher. But here the results are 2x worse than in those tests, so I cannot blame the network now. Yet 50k RPS is somewhere on lower side of results observed in different tests with lightweight payloads, I've been expecting to see maybe 100k or 150k.
+In all three worker modes (even in non-blocking CAS mode) the throughput seem to cap at 50k RPS. I used the same 20 vCPU client and 20 vCPU server as with Fiber+hey, but this time with GRPC+ghz, in the same cloud. Actually, I hesitate to make conclusions that this is the limit of GRPC performance, because in Fiber tests I suspected the cloud-supplied network to be the bottleneck, and believed the real productivity to be much higher. But here the results are 2x worse than in those tests, so I cannot blame the network now. Yet 50k RPS is somewhere on lower side of results observed in different tests with lightweight payloads, I've been expecting to see maybe 100k or 150k. See local tests, though (not LAN), for futher observations on that.
 
 Let's postpone any conclusions for now - to a moment when I conduct LAN based tests.
 
@@ -315,7 +315,7 @@ As I discovered, the Go profiler in the RTL gathers blocked time and CPU time se
 **CPU times** were like this: workerFunc (reads, parses, handles request and sends a response) = 69.3%, net.(\*conn).Read (reads request) = 29.3%, net.(\*conn).Write = 38.5%, that only leaves 1.5% inside workerFunc unaccounted for. Basically, unless I find out how to dramatically reduce costs of Read and Write, it does not make sense to look for other reasons of slowness. On the other hand 30% more samples are gathered somewhere else; actually 10% is netpoll+kevent, but 10% is 
 somewhere around mPark, which seems very weird / something to investigate as TODO, because no way the application is too often left without work with 100K requests coming each second. Or can it? If requests are really processed very quickly, it could be - but then we could have been able to serve 200K instead, which we cannot. On the other hand we don't know why we cannot, because this is only a local test, maybe just it's my client is not fast enough to keep up. Another reason could be high lock contention, like, we have 100k running goroutines but all of them are waiting for something, so no other work available for the machine. If so, that would be reflected in Blocks profile, that we will look into shortly. But ultimately, that's something to look up later, but anyway even stripping away 10% of CPU time will not significantly speed us up.
 
-Another question is, how can we see read and write on CPU sampling if those functions are supposed to be nonblocking for network sockets? I even took care to use netstat -an | grep 8000 | awk '\$2 > 0 || \$3 > 0' to see how many connections have something queued, and yes, a couple hundreds do. It seems weird, because why will data sit there and not get transferred into socket? The doorbell for transferring to network card is supposed to be signaled each microsecond or so. Does appearing on CPU samples and on netstat indicate they are blocking actually? Well no, blocking would not show them on CPU, but rather on Block profile; but they might be spinning rather than sleeping. Also yet, if waiting happens inside a syscall, the goroutine cannot be preemted and thus will show up on CPU samples.
+Another question is, how can we see read and write on CPU sampling if those functions are supposed to be nonblocking for network sockets? I even took care to use netstat -an | grep 8000 | awk '\$2 > 0 || \$3 > 0' to see how many connections have something queued, and yes, a couple hundreds do. It seems weird, because why will data sit there and not get transferred into socket? The doorbell for transferring to network card is supposed to be signaled each microsecond or so. Does appearing on CPU samples and on netstat indicate they are blocking actually? Well no, blocking would not show them on CPU, but rather on Block profile; but they might being rather than sleeping. Also yet, if waiting happens inside a syscall, the goroutine cannot be preemted and thus will show up on CPU samples.
 
 (Actually "list Write" says /usr/local/go/src/internal/poll/fd_unix.go calling ignoringEINTRIO(syscall.Write...) in a loop, so it's really spinning)
 
@@ -325,7 +325,8 @@ Yet, if read and write appears on CPU sampling because of spinning, why would th
 
 So I consider the mistery solved, at least until proper LAN tests.
 And I consider writes and reads justified.
-And I consider I don't have any room for improvement here.
+And I think I don't have any room for improvement here.
+And I think that simply using more CPU will linearly scale thoughput, because 70% of all CPU spent by limiter is spent on reads and writes.
 
 Oh, but that analysis would be incomplete without looking for **profile of blocks**, like I promised earlier.
 93% of all time spent in block-waiting is workerFunc, that's cumulative, 82% being channel read reading from network, and 12% being serveconn (which deserializes and executes request and sends a response) - those 12% are caused by a mutex I use for collecting VictoriaMetrics, so it's not really Fiber's problem.
@@ -334,12 +335,24 @@ then 82+12 is only 1% short of 93%, no sense in analysing that 1%. And 100-93=7%
 
 If we look at blocking implementation P=M for comparison, even though it's unlikely that read/write behavoir (which took up most of time earlier) will be different, we see that 20% of blocks is spent waiting for mutex, but it's not that bad: again, 20% of blocked time is not the same as 20% of total test time.
 
-6. LAN based tests
+6. Local test
+
+Though such tests are bound to have deficiency, they still can be useful in terms that they can produce better figures than cloud tests, especially with me only using cheaper clouds.
+
+Running Fiber on M1 Air 8-cpu allowed me to get 100K rps with P=C (see PProf investigation above), and on M2 Pro I had been able to get 150K rps.
+Actually, I had a hard time with that, because initially I only got 33K on M2 :) I have been reasonably sure that has to be because of some system settings, but there are tons of them. Actually one thing I messed up myself - downloading AMD64 hey executable instead on ARM64, which it silently executed via Rosette without any apparent warnings :) But it turned out this wasn't a reason of slowness. It was the settings, and I must admit AI proved quite valueable here, because it remembers tons of things and because of it tends not overlook little details (not always though). I gave it diff between sysctl -an on these machines, 2K lines long, and it pinpointed likely culrpits. Actually, it was wrong on priorities, but still "net.necp.pass_loopback = 2" was its finding, and although it did not explain at once the precise meaning, it of course said it has to do with doing tests on localhost. And ho, it means using installed filters for loopback packets as well as external communications. Turning that off for that M2 finally got me >100K rps.
+
+gPRC got me 50K on M1 and 75K on M2. Same range of improvement as with Fiber, mind you, and as with CPU core count, so both are actually showing linear scaling. Interesting thing is, thought I still don't clearly see what is the bottleneck for Fiber, for gRPC it appears to be CPU consumption by ghz. Which is insane, because 75K rps I got with 8 cores used by ghz and only 2 cores used by limiter! For some unknown reason, client load generation appears to be extremely costly with gRPC, or maybe it's just ghz's problem. Anyway, extrapolating from that, one could expect limiter using all 12 cores to serve 450K rps locally with GRPC, although I'll never be able to generate that much load locally. Unless bottlenecked at some other thing, of course. Fiber at 150K consumed about 250% cores, projecting at around 720K rps using 12 cores.
+
+Another thing worth noting is, despite profiling showing different load distribution for 1-connection and 10-connection gRPC runs, the end result remained the same, and it even got worse when I used say 50 connections. 
+
+So we can already start making some conclusion about gRPC being allegedly faster than http 1. Its expected speed benefits come from simpler deserialization (which does not mean a lot when the payload/URL is simple) and lighter data (also does not mean a lot when payloads are little). Being able to execute multiple requests in parallel via one connection is not actually a speed benefit but rather a connection resource usage benefit, an important thing especially for outbound and not inbound limiter, but not affecting speed directly unless one runs out of available connections at the server. Besides, for limiter's model of use, in does not make sense for a caller of each request to execute new request before it received response to the last one and then executed actuall outbound request, even though the client as a whole (running different activities on multiple threads) will of course want to execute different requests in parallel.
+
+Still, we need to wait for LAN tests before any final conclusions. Real network transfers might better react to reduced load with gRPC, for example.
+
+7. LAN based tests
 
 ...coming as soon as I buy Thunderbolt cable
 
 // /opt/homebrew/opt/etcd/bin/etcd
 
-+ Провести тест с grpc (и почему медленнее?)
-
-+ в резюме - pperf, и освежил знания по работе TCP
