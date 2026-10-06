@@ -10,21 +10,21 @@ import (
 	"github.com/form3tech-oss/f1/v2/pkg/f1"
 	"github.com/form3tech-oss/f1/v2/pkg/f1/testing"
 
-	"limiter/server"
+	"github.com/mgumerov/limiter/internal/limiter"
 )
 
 type TestServer struct {
-	processor   server.Processor
+	processor   limiter.Processor
 	handlerTime *metrics.Summary //maybe histogram? also, might introduce extra delays and contention
 }
 
-var _ server.Server = (*TestServer)(nil) //fail-fast type guard
+var _ limiter.Server = (*TestServer)(nil) //fail-fast type guard
 
 type TestResult struct {
 	stretch int64
 }
 
-func CreateTestServer(processor server.Processor, serverFailed chan<- struct{}, cfg *server.Config, myMetrics *metrics.Set) server.Server {
+func CreateTestServer(processor limiter.Processor, serverFailed chan<- struct{}, cfg *limiter.Config, myMetrics *metrics.Set) limiter.Server {
 	var handlerTime = myMetrics.NewSummary("handler_time")
 	var granted = myMetrics.NewCounter("granted")
 	

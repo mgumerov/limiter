@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -11,18 +10,17 @@ import (
 	"syscall"
 	
 	"github.com/VictoriaMetrics/metrics"
-	"gopkg.in/yaml.v3"
 
-	management "limiter/mgmt"
+	management "github.com/mgumerov/limiter/internal/mgmt"
 
-	"limiter/casproc"
-	"limiter/consensus"
-	"limiter/fiberserver"
-	"limiter/grpcserver"
-	"limiter/mutexproc"
-	"limiter/server"
-	"limiter/testserver"
-	"limiter/workerproc"
+	"github.com/mgumerov/limiter/internal/processor/casproc"
+	"github.com/mgumerov/limiter/internal/consensus"
+	"github.com/mgumerov/limiter/internal/transport/fiberserver"
+	"github.com/mgumerov/limiter/internal/transport/grpcserver"
+	"github.com/mgumerov/limiter/internal/processor/mutexproc"
+	"github.com/mgumerov/limiter/internal/limiter"
+	"github.com/mgumerov/limiter/internal/transport/testserver"
+	"github.com/mgumerov/limiter/internal/processor/workerproc"
 )
 
 func main() {
@@ -39,7 +37,7 @@ func main() {
 	if configPath == "" {
 		configPath = "config.yaml"
 	}
-	cfg, err := LoadConfig(configPath)
+	cfg, err := limiter.LoadConfig(configPath)
 	if err != nil {
 		slog.Error("failed to load configuration", "path", configPath, "error", err)
 		os.Exit(1) //TODO
@@ -75,7 +73,7 @@ func main() {
 	tracker := consensus.StartMasterLeaseLoop(ctx, trackerFailed, cfg)
 
 	processorFailed := make(chan struct{}, 1)
-	var processor server.Processor
+	var processor limiter.Processor
 	switch v := os.Getenv("P"); v {
 	case "W": processor = workerproc.StartWorkerProcessor(processorFailed, cfg, myMetrics)
 	case "M": processor = mutexproc.StartMutexProcessor(processorFailed, cfg, myMetrics)
@@ -84,35 +82,35 @@ func main() {
 		retries, err := strconv.Atoi(r)
 		if err != nil {
 			slog.Error("Invalid retries count specified in env", "R", r)
-			processor = &NoOpProcessor{} //still create a stub to be safely passed as dependency
+			processor = &limiter.NoOpProcessor{} //still create a stub to be safely passed as dependency
 			processorFailed <- struct{}{}
 		}
 		processor = casproc.StartCasProcessor(processorFailed, cfg, myMetrics, retries)
 	}
-	case "N": processor = &NoOpProcessor{}
+	case "N": processor = &limiter.NoOpProcessor{}
 	default:
 		slog.Error("Invalid request processor specified in env", "P", v)
-		processor = &NoOpProcessor{} //still create a stub to be safely passed as dependency
+		processor = &limiter.NoOpProcessor{} //still create a stub to be safely passed as dependency
 		processorFailed <- struct{}{}
 	}
 
 	//Rather than make each Processor verify holding master's mantle, we decorate whatever Processor has been constucted 
 	// with orthogonal middleware (cross-cutting concern) for verification, leaving Processor and consensus-tracker uncoupled.
-	processor = &GuardedProcessor { next: processor, tracker: tracker }
+	processor = limiter.NewGuardedProcessor(processor, tracker)
 	
 	//Idiomatic approach says passing contexts along (here, or/and to fiber.Listen) because this clearly involves some 
 	// i/o and long activity. But actually it depends on how the called func will use the context: maybe I am passing 
 	// request-scoped context to some async processing, for example. In this case, passing globally-scoped notify-context 
 	// actually makes sense, but only if I want Fiber to use it for graceful shutdowns, and I stated above that I prefer it not to.
 	serverFailed := make(chan struct{}, 1)
-	var server server.Server
+	var server limiter.Server
 	switch v := os.Getenv("S"); v {
 	case "F": server = fiberserver.CreateFiberServer(processor, serverFailed, port, myMetrics)
 	case "G": server = grpcserver.CreateGRPCServer(processor, serverFailed, port, myMetrics)
 	case "T": server = testserver.CreateTestServer(processor, serverFailed, cfg, myMetrics)
 	default:
 		slog.Error("Invalid request server specified in env", "S", v)
-		server = &NoOpServer{} //still create a stub to be safely passed as dependency
+		server = &limiter.NoOpServer{} //still create a stub to be safely passed as dependency
 		serverFailed <- struct{}{}
 	}
 
@@ -154,59 +152,4 @@ func main() {
 	if mgmt != nil {
 		mgmt.Shutdown()
 	}
-}
-
-func LoadConfig(path string) (*server.Config, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("reading config file: %w", err)
-	}
-
-	var cfg server.Config
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("parsing YAML: %w", err)
-	}
-
-	//This is better be decoupled from reading because we could load config from different sources. For now, we don't.
-	if cfg.MaxRequest == 0 {
-		return nil, fmt.Errorf("Maximum request size is not defined")
-	}
-
-	return &cfg, nil
-}
-
-type NoOpProcessor struct {
-}
-
-func (p *NoOpProcessor) Request(key string, amount int32) server.Response {
-	return server.Response { Granted: 0 }
-}
-
-func (p *NoOpProcessor) Close() {
-	//Do nothing
-}
-
-type NoOpServer struct {
-}
-
-func (p *NoOpServer) Shutdown() error {
-	return nil
-}
-
-type GuardedProcessor struct {
-	next server.Processor
-	tracker server.ConsensusTracker
-}
-
-func (p *GuardedProcessor) Request(key string, amount int32) server.Response {
-	if !p.tracker.IAmMaster() {
-		//TODO think of some way of signaling that the client is using the wrong instance of server and it's not normal 429
-		// maybe some HTTP response codes are already well suited for that
-		return server.Response { Granted: 0 }
-	}
-	return p.next.Request(key, amount)
-}
-
-func (p *GuardedProcessor) Close() {
-	p.next.Close()
 }

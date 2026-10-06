@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package limiter;
 
-option go_package = "limiter/proto";
+option go_package = "github.com/mgumerov/limiter/api/proto";
 
 service Limiter {
   rpc Request(RequestRequest) returns (RequestResponse);

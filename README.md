@@ -24,6 +24,39 @@ like whether to allow exceeding of a limit, or how malicious our clients might b
 - It publishes some Prometheus metrics to allow observing its statistics; however it cannot publish too much details because gathering them would introduce extra contention and damage the performance.
 - Also carries gRPC server as an option
 
+## Project layout
+
+```
+cmd/limiter/                  main package: reads env vars, loads config, wires the pieces together
+internal/limiter/             core types (Processor, Server, Config, Bucket), the refill algorithm, config loading,
+                              and the NoOp/Guarded processor decorators
+internal/processor/mutexproc  Processor serialized by a sync.Mutex             (P=M)
+internal/processor/workerproc Processor serialized by a single worker goroutine (P=W)
+internal/processor/casproc    lock-free compare-and-set Processor               (P=C, retries in R)
+internal/processor/processortest  behavioural tests shared by all Processors
+internal/transport/fiberserver    HTTP front end on Fiber                       (S=F)
+internal/transport/grpcserver     gRPC front end                                (S=G)
+internal/transport/testserver     in-process F1 load test, no network           (S=T)
+internal/consensus/           etcd-based leader lease, so only one instance serves at a time
+internal/mgmt/                management endpoint: /metrics and profiling start/stop
+api/proto/                    limiter.proto and the generated gRPC code
+config.yaml                   default configuration (override with CONFIG_PATH)
+```
+
+## Build, test, run
+
+```
+go build ./...                  # build everything
+go test ./...                   # unit tests
+go generate ./api/proto         # regenerate gRPC code (needs protoc, protoc-gen-go, protoc-gen-go-grpc)
+
+P=M S=F go run ./cmd/limiter    # Mutex processor behind Fiber HTTP on :8000
+```
+
+Environment variables: `P` (processor: `M`, `W`, `C`, `N`), `S` (server: `F`, `G`, `T`), `R` (retries for `P=C`),
+`PORT` (default 8000), `MPORT` (management port, default 8001, `0` disables it), `CONFIG_PATH` (default `config.yaml`),
+`LOG_LEVEL` (`DEBUG`, `INFO`, ...).
+
 ## Next steps:
 - Use fast LAN and two good machines to get big enough load to see Fiber's limits
 
@@ -199,7 +232,7 @@ like whether to allow exceeding of a limit, or how malicious our clients might b
 // Можно даже готовую либу вроде F1 использовать, потому что тогда весь тест это 10-liner который к тому же умеет
 // брать параметры запуска из командной строки
 // Вот я прогнал локальные тесты как делал удаленно - скажем (2x128)x350 - это прицел в 88k запросов в секунду
-// P=M S=T go run . run constant tests --rate 88000/s  --concurrency 256
+// P=M S=T go run ./cmd/limiter run constant tests --rate 88000/s  --concurrency 256
 // => p50 = 375 нс (!), p90 = 25 мкс, p97 = 1.2 мс, p99 = 2.6 мс, max= 7 мс
 // Далее эту нагрузку УДВОИЛ и все равно за 992 мс выполнил 176к запросов,
 // => p99 = 3мс, max = 15 мс, а в целом так же
@@ -209,9 +242,9 @@ like whether to allow exceeding of a limit, or how malicious our clients might b
 // => p50 = 208 нс (все еще!), p90 = 6 мкс (все еще!), p97 = 755 мкс, p99 = 2 мс, max = 11 мс (в сущности хуже не стало!)
 
 //Ну это было с M процессором, теперь нужно сравнить с W - сколько успеет разгрести он
-//P=W S=T go run . run constant tests --rate 350000/s  --concurrency 256
+//P=W S=T go run ./cmd/limiter run constant tests --rate 350000/s  --concurrency 256
 //=> P50 = 228 mks, P90 = 300 mks, P97 = 363 mks, P99 = 628 mks, max = 1.5 ms
-//P=W S=T go run . run constant tests --rate 2000000/s  --concurrency 256
+//P=W S=T go run ./cmd/limiter run constant tests --rate 2000000/s  --concurrency 256
 //=> P50 = 99 mks, P90 = 147 mks, P97 = 195 mks, P99 = 406 mks, max = 820 mks
 //Но это предел. Больше 2 млн не успеваем (пробовал concurrency=512, не лучше)
 //Пока неясно, почему - возможно (было бы логичнее всего) из-за тяжелого начала распределения, все-таки тут P50 в 100-1000 раз тяжелее
@@ -240,10 +273,10 @@ like whether to allow exceeding of a limit, or how malicious our clients might b
 //Добавил ограничение на ретраи (точнее - на попытки).
 //Любопытно, ранее granted 1285718 показывало, что мы не сумели выдать некоторые гранты, я думал что они просто не были выпущены;
 //но теперь сомневаюсь, потому что вместо неограниченных попыток spin-lock я добавил ограничение и результат очень интересный:
-//P=C S=T R=3 go run . run constant tests --rate 6000000/s  --concurrency 256
+//P=C S=T R=3 go run ./cmd/limiter run constant tests --rate 6000000/s  --concurrency 256
 // => Stopping metrics="granted 1284507\nhandler_time{quantile=\"0.5\"} 1.66e-07\nhandler_time{quantile=\"0.9\"} 3.34e-07\nhandler_time{quantile=\"0.97\"} 4.59e-07\nhandler_time{quantile=\"0.99\"} 5.83e-07\nhandler_time{quantile=\"1\"} 0.075429208\nhandler_time_sum 3.0163244880136544\nhandler_time_count 6000000\nlost_adding 302\nlost_granting 11686\n"
 // (так же потеряно 11к токенов, но видим что они потеряны в основном на ВЫДАЧЕ, где ранее вообще-то не было ограничения, возможно стоит проверить еще раз прежний вариант)
-//P=C S=T R=30 go run . run constant tests --rate 6000000/s  --concurrency 256
+//P=C S=T R=30 go run ./cmd/limiter run constant tests --rate 6000000/s  --concurrency 256
 // => Stopping metrics="granted 1294226\nhandler_time{quantile=\"0.5\"} 1.66e-07\nhandler_time{quantile=\"0.9\"} 3.75e-07\nhandler_time{quantile=\"0.97\"} 4.59e-07\nhandler_time{quantile=\"0.99\"} 6.25e-07\nhandler_time{quantile=\"1\"} 0.072911542\nhandler_time_sum 2.7223297160008206\nhandler_time_count 6000000\nlost_adding 0\nlost_granting 0\n"
 // (30 ретраев достаточно чтобы обойтись без потерь на выдаче, вот тут вероятно потери были на выпуске)
 //Потери на выпуске считать сложно, потому что два параллельных выпуска друг друга частично страхуют и не все токены теряются,
@@ -274,7 +307,7 @@ like whether to allow exceeding of a limit, or how malicious our clients might b
 
 3. HA tests (with locally running etcd)
 
-// P=C S=T R=3 go run . run constant tests --rate 6000000/s  --concurrency 256
+// P=C S=T R=3 go run ./cmd/limiter run constant tests --rate 6000000/s  --concurrency 256
 // => Уже не справляемся. Как правило, не справляемся даже с 5500000, но это может объясняться тем, что etcd хоть и не используется
 //    активно, все же ворует некоторое количество ресурсов.
 // С 5400 иногда справляемся, то есть падение производительности составляет 10-15% - плата за HA

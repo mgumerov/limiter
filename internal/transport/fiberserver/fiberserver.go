@@ -12,12 +12,12 @@ import (
 
 	"github.com/VictoriaMetrics/metrics"
 
-	"limiter/server"
+	"github.com/mgumerov/limiter/internal/limiter"
 )
 
-var _ server.Server = (*fiber.App)(nil) //fail-fast type guard
+var _ limiter.Server = (*fiber.App)(nil) //fail-fast type guard
 
-func CreateFiberServer(processor server.Processor, fiberFailed chan<- struct{}, port string, myMetrics *metrics.Set) server.Server {
+func CreateFiberServer(processor limiter.Processor, fiberFailed chan<- struct{}, port string, myMetrics *metrics.Set) limiter.Server {
 	fiber := createHTTP(processor, fiberFailed, myMetrics)
 	//This creates (or eventually creates) Fiber's goroutines that will then execute our functions which in turn access Config
 	// and Processor's state. Because starting a goroutine is sequenced-after any code leading to it, and serialized-before the goroutine's
@@ -27,7 +27,7 @@ func CreateFiberServer(processor server.Processor, fiberFailed chan<- struct{}, 
 	return fiber
 }
 
-func createHTTP(processor server.Processor, fiberFailed chan<- struct{}, myMetrics *metrics.Set) *fiber.App {
+func createHTTP(processor limiter.Processor, fiberFailed chan<- struct{}, myMetrics *metrics.Set) *fiber.App {
 	handlerTime := myMetrics.NewHistogram("handler_time")
 
 	app := fiber.New()

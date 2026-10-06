@@ -6,7 +6,7 @@ import (
 
 	"github.com/VictoriaMetrics/metrics"
 
-	"limiter/server"
+	"github.com/mgumerov/limiter/internal/limiter"
 )
 
 //This approach tries to make a compare-and-set-style update on bucket's count instead of putting mutex on it,
@@ -44,12 +44,12 @@ type CasProcessor struct {
 	// entries, forcing us to replace the whole entry (=read struct and write changed struct), effectively invalidating the approach.
 	// So in this processor we store pointers in the map. It's still not that bad, because those extra allocations are only made once.
 	buckets map[string]*Bucket
-	cfg *server.Config
+	cfg *limiter.Config
 	retries int
 	lostAdding *metrics.Counter
 	lostGranting *metrics.Counter
 }
-var _ server.Processor = (*CasProcessor)(nil) //fail-fast type guard
+var _ limiter.Processor = (*CasProcessor)(nil) //fail-fast type guard
 
 //Unfortunately we also need to have our own struct. Even if we can manage without modern atomic API (Int64.Add etc.),
 // if we want to be cross platform (target 32bit platforms as well), then "legacy" atomic APIs might cause kernel panic
@@ -70,7 +70,7 @@ type Bucket struct {
 // and under that circumstances rejecting a small extra fraction of requests to that bucket is probably OK. If more precision is necessary, 
 // you might want to adjust that to 10 or even 100, but high values will be of little help because if request contention is that high, 
 // spin-locks themselves will start draining more CPU than actual processing.
-func StartCasProcessor(processorFailed chan<- struct{}, cfg *server.Config, myMetrics *metrics.Set, retries int) *CasProcessor {
+func StartCasProcessor(processorFailed chan<- struct{}, cfg *limiter.Config, myMetrics *metrics.Set, retries int) *CasProcessor {
 	buckets := make(map[string]*Bucket)
 	startedAt := time.Now()
 	for key, limit := range cfg.APIs {
@@ -103,11 +103,11 @@ func StartCasProcessor(processorFailed chan<- struct{}, cfg *server.Config, myMe
 //  thus making algorithm simpler and more atomic, but the beauty here is in NOT doing that. Everyone can do base value substractions
 //  and bit shifts (and that is not something in real demand these days), not everyone can come up with concurrent algorithm not relying
 //  on being atomic and surviving explicitly pipelinining its work in time.
-func (p *CasProcessor) Request(key string, amount int32) server.Response {
+func (p *CasProcessor) Request(key string, amount int32) limiter.Response {
 	//Make own copy
 	pBucket, ok := p.buckets[key]
 	if (!ok) {
-		return server.Response { Granted: 0 } //for real use, we should maybe distinguish this error reason
+		return limiter.Response { Granted: 0 } //for real use, we should maybe distinguish this error reason
 	}
 
 	//The algorithm is conceptually identical to the one used in other Processors, so most actions are explained there and I don't repeat it here.
@@ -217,7 +217,7 @@ func (p *CasProcessor) Request(key string, amount int32) server.Response {
 		}
 	}
 
-	return server.Response { Granted: granted }
+	return limiter.Response { Granted: granted }
 }
 
 func (p *CasProcessor) Close() {

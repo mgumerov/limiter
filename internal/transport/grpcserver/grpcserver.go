@@ -9,15 +9,15 @@ import (
 	"github.com/VictoriaMetrics/metrics"
 	"google.golang.org/grpc"
 
-	"limiter/server"
-	pb "limiter/grpcserver/proto"
+	"github.com/mgumerov/limiter/internal/limiter"
+	pb "github.com/mgumerov/limiter/api/proto"
 )
 
 type GRPCServer struct {
 	grpc *grpc.Server
 }
 
-var _ server.Server = (*GRPCServer)(nil)
+var _ limiter.Server = (*GRPCServer)(nil)
 
 func (s *GRPCServer) Shutdown() error {
 	s.grpc.GracefulStop()
@@ -27,7 +27,7 @@ func (s *GRPCServer) Shutdown() error {
 type limiterService struct {
 	pb.UnimplementedLimiterServer
 
-	processor   server.Processor
+	processor   limiter.Processor
 	handlerTime *metrics.Histogram
 }
 
@@ -57,11 +57,11 @@ func (s *limiterService) Request(
 }
 
 func CreateGRPCServer(
-	processor server.Processor,
+	processor limiter.Processor,
 	grpcFailed chan<- struct{},
 	port string,
 	myMetrics *metrics.Set,
-) server.Server {
+) limiter.Server {
 
 	grpcSrv := createGRPC(
 		processor,
@@ -79,7 +79,7 @@ func CreateGRPCServer(
 }
 
 func createGRPC(
-	processor server.Processor,
+	processor limiter.Processor,
 	grpcFailed chan<- struct{},
 	myMetrics *metrics.Set,
 ) *GRPCServer {

@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"limiter/server"
+	"github.com/mgumerov/limiter/internal/limiter"
 	"log/slog"
 	"sync/atomic"
 	"time"
@@ -17,7 +17,7 @@ import (
 type EtcdConsensusTracker struct {
 	lease atomic.Pointer[Lease]
 }
-var _ server.ConsensusTracker = (*EtcdConsensusTracker)(nil) //fail-fast type guard
+var _ limiter.ConsensusTracker = (*EtcdConsensusTracker)(nil) //fail-fast type guard
 
 //Here is where I will compromise. Problem is, etcd is not built for sub-second TTLs - even if I set a very brief
 // leader election timeout of under 600s, it will only mean TTL=1 seconds. Meaning, if our cluster gets a split-brain right
@@ -57,7 +57,7 @@ const ETCD_TIMEOUT = time.Duration(300) * time.Millisecond
 // like "give it enough time to let it do at least one retry".
 const KEEP_ALIVE_ATTEMPT_TIMEOUT = time.Duration(300) * time.Millisecond
 
-func StartMasterLeaseLoop(ctx context.Context, failed chan struct{}, cfg *server.Config) server.ConsensusTracker {
+func StartMasterLeaseLoop(ctx context.Context, failed chan struct{}, cfg *limiter.Config) limiter.ConsensusTracker {
 	if cfg.ETCDkey == "" {
 		slog.Info("No etcd key configured. Unable to start consensus tracker.")
 		slog.Warn("Running without distributed consensus configured! To be used only as a single instance.")
@@ -202,7 +202,7 @@ func (p *EtcdConsensusTracker) IAmMaster() bool {
 
 type AlwaysMasterConsensusTracker struct {
 }
-var _ server.ConsensusTracker = (*AlwaysMasterConsensusTracker)(nil) //fail-fast type guard
+var _ limiter.ConsensusTracker = (*AlwaysMasterConsensusTracker)(nil) //fail-fast type guard
 
 func (p *AlwaysMasterConsensusTracker) IAmMaster() bool {
 	return true
