@@ -321,7 +321,7 @@ Environment variables: `P` (processor: `M`, `W`, `C`, `N`), `S` (server: `F`, `G
 // где рефреш индекса происходит периодически, а не постоянно) - так что в результате данные за последние 1-5 секунд сначала 
 // вообще не появлялись, а затем появлялись скачком, как только становились видимы после flush.
 // Пришлось вместо ВМ взять Прометеус, где этого эффекта нет.
-// Запускаем /opt/homebrew/opt/prometheus/bin/prometheus_brew_services
+// Запускаем make prometheus (внес в мейкфайл)
 // И видим график - после прерывания инстанса он прекращает выдавать метрики, но другой инстанс не начинает их выдавать сразу, 
 // а лишь скажем через 300мс - когда у первого сгорает аренда.
 
@@ -386,6 +386,4 @@ Still, we need to wait for LAN tests before any final conclusions. Real network 
 7. LAN based tests
 
 ...coming as soon as I buy Thunderbolt cable
-
-// /opt/homebrew/opt/etcd/bin/etcd
 
