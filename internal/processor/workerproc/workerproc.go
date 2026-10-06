@@ -5,23 +5,23 @@ import (
 	"time"
 	"github.com/VictoriaMetrics/metrics"
 
-	"limiter/server"
+	"github.com/mgumerov/limiter/internal/limiter"
 )
 
 type WorkerProcessor struct {
 	rqChan chan<- Request
 }
-var _ server.Processor = (*WorkerProcessor)(nil) //fail-fast type guard
+var _ limiter.Processor = (*WorkerProcessor)(nil) //fail-fast type guard
 
 type Request struct {
 	key string
 	amount int32
-	reply chan<- server.Response
+	reply chan<- limiter.Response
 }
 
 //Like Processor interface says, the created instance is thread safe to use but still has to be published safely.
 //See Request function here for details.
-func StartWorkerProcessor(processorFailed chan<- struct{}, cfg *server.Config, myMetrics *metrics.Set) *WorkerProcessor {
+func StartWorkerProcessor(processorFailed chan<- struct{}, cfg *limiter.Config, myMetrics *metrics.Set) *WorkerProcessor {
 	reqChan := make(chan Request) //Unbuffered, because what good such buffering is - under heavy load? Verified it by load testing with buffer of 1.
 	ptime := myMetrics.NewSummary("processing_time")
 	
@@ -35,14 +35,14 @@ func StartWorkerProcessor(processorFailed chan<- struct{}, cfg *server.Config, m
 			}
 		}()
 		
-		buckets := make(map[string]server.Bucket)
+		buckets := make(map[string]limiter.Bucket)
 		startedAt := time.Now()
 		for key, limit := range cfg.APIs {
 			//We could start with startedAt=0, but then one of two things happen
 			// - either first request interpretes that 0 as "empty bucket" - i.e. bucket starts refilling only then (so some time is lost)
 			// - or maybe as "full bucket" - bad if service is restarted from empty bucket and restart took less than 1 second (so, extra request may pass through)
 			//Also we start with empty buckets because of that same problem with "full bucket" approach
-			buckets[key] = server.Bucket { Limit: limit, StartedAt: startedAt }
+			buckets[key] = limiter.Bucket { Limit: limit, StartedAt: startedAt }
 		}
 
 		//Note, range loop, just like 2-argument reading form, checks for closing the channel,
@@ -70,18 +70,18 @@ func StartWorkerProcessor(processorFailed chan<- struct{}, cfg *server.Config, m
 			//TODO might need to retest that when have more mature approach to tests
 			bucket, ok := buckets[request.key]
 			if (!ok) {
-				request.reply <- server.Response { Granted: 0 } //for real use, we should maybe distinguish this error reason
+				request.reply <- limiter.Response { Granted: 0 } //for real use, we should maybe distinguish this error reason
 				continue
 			}
 
-			server.Refill(&bucket, time.Now())
+			limiter.Refill(&bucket, time.Now())
 
 			if (request.amount > cfg.MaxRequest) {
 				request.amount = cfg.MaxRequest
 			}
 			granted := min(request.amount, bucket.Count)
 			bucket.Count -= granted
-			request.reply <- server.Response { Granted: granted }
+			request.reply <- limiter.Response { Granted: granted }
 			buckets[request.key] = bucket
 
 			ptime.UpdateDuration(start)
@@ -95,11 +95,11 @@ func StartWorkerProcessor(processorFailed chan<- struct{}, cfg *server.Config, m
 //All actual processing in this Processor is performed on one goroutine; however the Request func (the one feeding data to it) 
 // is still called from any number of goroutines, therefore such a goroutine might not see initialized field p.rqChan 
 // unless safe publication to that goroutine is somehow ensured.
-func (p *WorkerProcessor) Request(key string, amount int32) server.Response {
+func (p *WorkerProcessor) Request(key string, amount int32) limiter.Response {
 	//buffered, because it makes no sense to block when responding, however little are chances;
 	// also, this avoids depending on the receiving side _still being alive_ (might have panicked or whatever)
 	//TODO potentially a performace hindrance, say 1M allocations/second, need to somehow measure and try another approach
-	reply := make(chan server.Response, 1)
+	reply := make(chan limiter.Response, 1)
 	p.rqChan <- Request { key: key, amount: amount, reply: reply }
 	return <- reply
 }

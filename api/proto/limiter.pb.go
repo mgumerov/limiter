@@ -128,7 +128,7 @@ const file_proto_limiter_proto_rawDesc = "" +
 	"\x0fRequestResponse\x12\x18\n" +
 	"\agranted\x18\x01 \x01(\x05R\agranted2G\n" +
 	"\aLimiter\x12<\n" +
-	"\aRequest\x12\x17.limiter.RequestRequest\x1a\x18.limiter.RequestResponseB\x0fZ\rlimiter/protob\x06proto3"
+	"\aRequest\x12\x17.limiter.RequestRequest\x1a\x18.limiter.RequestResponseB'Z%github.com/mgumerov/limiter/api/protob\x06proto3"
 
 var (
 	file_proto_limiter_proto_rawDescOnce sync.Once
