@@ -78,7 +78,9 @@ func StartMasterLeaseLoop(ctx context.Context, failed chan struct{}, cfg *limite
 			failed <- struct{}{}
 			return 
 		}
-		defer cli.Close()
+		defer func(){
+			_ = cli.Close()
+		}()
 
 		//Eventually I came to this approach. See end of file for (1) with explanation of alternatives
 		//Loop invariant: this instance does not hold an active lease supporting this instance's claim of ownership (lease-guarded key in etcd)
@@ -115,12 +117,6 @@ func StartMasterLeaseLoop(ctx context.Context, failed chan struct{}, cfg *limite
 	return &tracker
 }
 
-func sleep(d time.Duration) {
-	t := time.NewTicker(d)
-	defer t.Stop()
-	<- t.C
-}
-
 type Lease struct {
 	ID      	etcd.LeaseID
 	Requested  	time.Time		//Must contain monotonic clock. For example, time.Now() does.
@@ -148,7 +144,7 @@ func acquireLease(ctx context.Context, cli *etcd.Client) (Lease, error) {
 	// On the other hand, they provided an example. I will adhere to it, but of course an example might not be a production grade approach.
 	resp, err := cli.Grant(ctx,  LEASE_TIME_REQUEST)
 	if err != nil {
-		return Lease{}, fmt.Errorf("Failed to get new lease: %w", err)
+		return Lease{}, fmt.Errorf("failed to get new lease: %w", err)
 	}
 	//Note how we use time-of-request (as seen from our side) as starting point for TTL.
 	// We cannot be sure what the true starting point is, but this pick at least is guaranteed to be earlier in time;
@@ -226,7 +222,7 @@ func waitForKeyDeletion(parentCtx context.Context, cli *etcd.Client, offendingKe
 		etcd.WithFilterPut() /* skip all PUTs, because we only want DELETEs */,
 		etcd.WithRev(offendingKey.CreateRevision)) {
 			if batch.Canceled { //In case of an error (NOT of context cancellation, mind you!)
-				err = fmt.Errorf("Etcd watch error: %w", batch.Err())
+				err = fmt.Errorf("etcd watch error: %w", batch.Err())
 				continue //although the contact says it's the last message anyway
 			}
 			for _, event := range batch.Events {
@@ -274,7 +270,7 @@ func (p *EtcdConsensusTracker) tryCaptureAndHold(pctx context.Context, cli *etcd
 	// to etcd server is grpc.
 	lease, err := acquireLease(ctx, cli) 
 	if err != nil {
-		return nil, fmt.Errorf("Cannot acquire a lease: %w", err)
+		return nil, fmt.Errorf("cannot acquire a lease: %w", err)
 	}
 
 	//Normally when the current function returns it's because the lease is expired anyway, but there are cases when it's not:
@@ -302,7 +298,7 @@ func (p *EtcdConsensusTracker) tryCaptureAndHold(pctx context.Context, cli *etcd
 
 	offendingKey, err := createKey(ctx, cli, keyname, lease)
 	if err != nil {
-		return nil, fmt.Errorf("Key creation failed: %w", err)
+		return nil, fmt.Errorf("key creation failed: %w", err)
 	}
 	if offendingKey != nil {
 		return offendingKey, nil
@@ -363,7 +359,7 @@ func keepLeaseAlive(ctx context.Context, cli *etcd.Client, lease Lease) <-chan L
 		minStep := time.Duration(500) * time.Millisecond // Same as in recommended KeepAlive loop
 
 		//Set up initial invariant
-		var newLease Lease = lease
+		newLease := lease
 		var err error
 		var nextAttempt time.Time
 		var step time.Duration

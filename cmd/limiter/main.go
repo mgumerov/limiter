@@ -126,6 +126,7 @@ func main() {
 	case <- trackerFailed:
 		slog.Error("Consensus-tracking engine failed")
 		tracker = nil
+		_ = tracker //bypass ineffassign
 	case <- mgmtFailed:
 		slog.Error("Management endpoint failed")
 		mgmt = nil

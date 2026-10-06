@@ -14,8 +14,6 @@ import (
 )
 
 type TestServer struct {
-	processor   limiter.Processor
-	handlerTime *metrics.Summary //maybe histogram? also, might introduce extra delays and contention
 }
 
 var _ limiter.Server = (*TestServer)(nil) //fail-fast type guard

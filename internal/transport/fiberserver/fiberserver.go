@@ -68,7 +68,7 @@ func createHTTP(processor limiter.Processor, fiberFailed chan<- struct{}, myMetr
 	app.Post("/:key", func(c fiber.Ctx) error {
 		q, err := strconv.ParseInt(c.Query("q", "1"), 10, 32)
 		if err != nil {
-			return fmt.Errorf("Amount parse error: %w", err)
+			return fmt.Errorf("amount parse error: %w", err)
 		}
 		return handler(c.Params("key"), int32(q), c)
 	})
@@ -76,7 +76,7 @@ func createHTTP(processor limiter.Processor, fiberFailed chan<- struct{}, myMetr
 	app.Get("/:key", func(c fiber.Ctx) error {
 		q, err := strconv.ParseInt(c.Query("q", "1"), 10, 32)
 		if err != nil {
-			return fmt.Errorf("Amount parse error: %w", err)
+			return fmt.Errorf("amount parse error: %w", err)
 		}
 		return handler(c.Params("key"), int32(q), c)
 	})

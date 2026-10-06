@@ -26,7 +26,7 @@ func StartManagementServer(failed chan<- struct{}, port string, metrics *metrics
 		mux.Handle("POST /prof/start/{filename}", http.HandlerFunc(func (w http.ResponseWriter, r *http.Request) {
 			if err := prom.startProfiling(r.PathValue("filename")); err != nil {
 				w.WriteHeader(500)
-				w.Write([]byte(err.Error()))
+				_,_ = w.Write([]byte(err.Error()))
 			} 
 		}))
 
@@ -34,9 +34,9 @@ func StartManagementServer(failed chan<- struct{}, port string, metrics *metrics
 			session, err := prom.stopProfiling();
 			if err != nil {
 				w.WriteHeader(500)
-				w.Write([]byte(err.Error()))
+				_,_ = w.Write([]byte(err.Error()))
 			} else {
-				w.Write([]byte(session.filename)) //todo download
+				_,_ = w.Write([]byte(session.filename)) //todo download
 			}
 		}))
 
@@ -70,7 +70,7 @@ func (p *Mgmt) startProfiling(filename string) error {
 	p.m.Lock()
 	defer p.m.Unlock()
 	if p.prof != nil {
-		err = errors.New("The profiling session is already started")
+		err = errors.New("the profiling session is already started")
 	} else {
 		p.prof, err = startProfiling(filename)
 	}
@@ -80,7 +80,7 @@ func (p *Mgmt) startProfiling(filename string) error {
 func (p *Mgmt) stopProfiling() (*Profiling, error) {
 	p.m.Lock()
 	if p.prof == nil {
-		return nil, errors.New("No active profiling session")
+		return nil, errors.New("no active profiling session")
 	}
 	defer p.m.Unlock()
 	stopProfiling(p.prof)
@@ -96,6 +96,6 @@ func (p *Mgmt) Shutdown() {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(3) * time.Second)
 	defer cancel()
 	if err := p.httpServer.Shutdown(ctx); err != nil {
-		slog.Error("Error while shutting down managements endpoint", "Error", err)
+		slog.Error("error while shutting down managements endpoint", "Error", err)
 	}
 }

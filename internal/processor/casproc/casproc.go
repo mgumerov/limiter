@@ -122,7 +122,7 @@ func (p *CasProcessor) Request(key string, amount int32) limiter.Response {
 	issuedWas := atomic.LoadInt64(&pBucket.Issued) //Copy it before calculations, because results of calculations will need to be applied only if value is not changed since
 
 	//Stage 1
-	var limit int32 = pBucket.Limit
+	var limit int32 = pBucket.Limit //lint:ignore ST1023 - want explicit type here
 	elapsed := now.Sub(pBucket.StartedAt).Nanoseconds()
 	expectation := float64(elapsed) / float64(time.Second.Nanoseconds()) * float64(limit)
 

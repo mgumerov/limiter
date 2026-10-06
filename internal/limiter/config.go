@@ -20,7 +20,7 @@ func LoadConfig(path string) (*Config, error) {
 
 	//This is better be decoupled from reading because we could load config from different sources. For now, we don't.
 	if cfg.MaxRequest == 0 {
-		return nil, fmt.Errorf("Maximum request size is not defined")
+		return nil, fmt.Errorf("maximum request size is not defined")
 	}
 
 	return &cfg, nil

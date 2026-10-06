@@ -55,7 +55,7 @@ func Refill(bucket *Bucket, now time.Time) {
 	//Have to re-establish some type boundaries to avoid precision loss (= increment in stairs)
 	// by accidentally casting float64(int64) when I wanted to cast float64(int32); or to avoid
 	// messing up integer conversion.
-	var limit int32 = bucket.Limit
+	var limit int32 = bucket.Limit  //lint:ignore ST1023 - want explicit type check
 
 	//Actually we don't need utmost precision here, if we pour less buckets this microsecond, we'll just pour more the next one;
 	// we only want it to be more or less smooth, so millis would not work good. At the same time, why lose precision by using micros
